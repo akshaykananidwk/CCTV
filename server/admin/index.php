@@ -39,9 +39,13 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($do === 'add_user') {
         $name = trim($_POST['name'] ?? '');
         $station = trim($_POST['police_station'] ?? '');
+        $designation = trim($_POST['designation'] ?? '');
         $username = trim($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
         $mobile = normalize_mobile($_POST['mobile'] ?? '');
+        $validDays = (int)($_POST['valid_days'] ?? 0);
+        $validUntil = $validDays > 0
+            ? date('Y-m-d H:i:s', strtotime("+$validDays days")) : null;
         if ($name === '' || $station === '' || strlen($password) < 6
             || !preg_match('/^[A-Za-z0-9_.-]{3,30}$/', $username)
             || strlen($mobile) !== 12) {
@@ -49,18 +53,53 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             try {
                 $pdo->prepare("INSERT INTO users
-                    (username, password_hash, name, police_station, mobile, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, 'active', ?)")
+                    (username, password_hash, name, police_station, designation,
+                     mobile, status, valid_until, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)")
                     ->execute([$username, password_hash($password, PASSWORD_DEFAULT),
-                        $name, $station, $mobile, now()]);
+                        $name, $station, $designation, $mobile,
+                        $validUntil, now()]);
+                // The password is NEVER sent on WhatsApp — the admin gives
+                // it personally, or the user sets one via Forgot Password.
                 wa_send($mobile,
-                    "🦚 Krishna Intelligence\n✅ Your software account is ready!\n"
-                    . "👤 Username: $username\n🔑 Password: $password\n"
-                    . "🏢 $station\nLogin from the software now.");
-                $msg = "User '$username' created and WhatsApp sent.";
+                    "🦚 Krishna Intelligence\n"
+                    . "✅ Your software account is ready!\n"
+                    . "🙍 Name: $name\n"
+                    . "🏢 Office: $station\n"
+                    . "🎖 Designation: $designation\n"
+                    . "👤 Username: $username\n"
+                    . "🌐 Server URL: " . cfg()['base_url'] . "\n"
+                    . "⏳ Validity: " . ($validUntil
+                        ? "till " . date('d-m-Y', strtotime($validUntil))
+                        : "unlimited") . "\n"
+                    . "🔑 Password: get it from your admin, or use "
+                    . "'Forgot Password' in the software to set your own.");
+                $msg = "User '$username' created and WhatsApp sent "
+                     . "(password NOT included in the message).";
             } catch (PDOException $e) {
                 $err = 'Username already exists.';
             }
+        }
+    }
+
+    if ($do === 'set_validity' && isset($_POST['uid'])) {
+        $days = (int)($_POST['days'] ?? 0);
+        $validUntil = $days > 0
+            ? date('Y-m-d H:i:s', strtotime("+$days days")) : null;
+        $pdo->prepare("UPDATE users SET valid_until = ? WHERE id = ?")
+            ->execute([$validUntil, (int)$_POST['uid']]);
+        $u = $pdo->prepare("SELECT * FROM users WHERE id = ?");
+        $u->execute([(int)$_POST['uid']]);
+        if ($row = $u->fetch(PDO::FETCH_ASSOC)) {
+            wa_send($row['mobile'],
+                "🦚 Krishna Intelligence\n"
+                . "⏳ Account validity updated for '{$row['username']}': "
+                . ($validUntil
+                    ? "valid till " . date('d-m-Y', strtotime($validUntil))
+                    : "unlimited") . ".");
+            $msg = "Validity for '{$row['username']}' set to "
+                 . ($validUntil ? date('d-m-Y', strtotime($validUntil))
+                                : 'unlimited') . ".";
         }
     }
 
@@ -93,10 +132,14 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 ->execute([password_hash($new, PASSWORD_DEFAULT), $row['id']]);
             $pdo->prepare("DELETE FROM sessions WHERE user_id = ?")
                 ->execute([$row['id']]);
+            // Password is NEVER sent on WhatsApp — shown to the admin only.
             wa_send($row['mobile'],
-                "🦚 Krishna Intelligence\n🔑 Password reset for '{$row['username']}'.\n"
-                . "New password: $new");
-            $msg = "Password reset — sent on WhatsApp to {$row['mobile']}.";
+                "🦚 Krishna Intelligence\n"
+                . "🔑 Your password was reset by admin for "
+                . "'{$row['username']}'.\nGet the new password from your "
+                . "admin, or use 'Forgot Password' in the software.");
+            $msg = "Password for '{$row['username']}' reset to: $new "
+                 . "(share it personally — NOT sent on WhatsApp).";
         }
     }
 
@@ -214,32 +257,56 @@ $totL = $pdo->query("SELECT COUNT(*) FROM login_logs")->fetchColumn();
 
 <?php if ($page === 'users'): ?>
   <div class="card">
-    <h2>➕ Create New User (WhatsApp credentials sent automatically)</h2>
+    <h2>➕ Create New User (details sent on WhatsApp — password is NOT sent)</h2>
     <form method="post">
       <input type="hidden" name="do" value="add_user">
       <input name="name" placeholder="Full Name" required>
-      <input name="police_station" placeholder="Police Station" required>
+      <input name="police_station" placeholder="Police Station / Office" required>
+      <input name="designation" placeholder="Designation / Post" required>
       <input name="username" placeholder="Username" required>
       <input name="password" placeholder="Password (min 6)" required>
       <input name="mobile" placeholder="WhatsApp Mobile" required>
+      <input name="valid_days" type="number" min="0" placeholder="Validity (days, 0=unlimited)" style="width:170px">
       <button>Create & Send WhatsApp</button>
     </form>
   </div>
   <div class="card">
     <h2>👥 All Users</h2>
     <table>
-      <tr><th>ID</th><th>Name</th><th>Police Station</th><th>Username</th>
-          <th>Mobile</th><th>Status</th><th>Created</th><th>Actions</th></tr>
-      <?php foreach ($pdo->query("SELECT * FROM users ORDER BY id DESC") as $u): ?>
+      <tr><th>ID</th><th>Name</th><th>Office</th><th>Designation</th>
+          <th>Username</th><th>Mobile</th><th>Status</th>
+          <th>⏳ Validity</th><th>Created</th><th>Actions</th></tr>
+      <?php foreach ($pdo->query("SELECT * FROM users ORDER BY id DESC") as $u):
+          $vExpired = !empty($u['valid_until'])
+              && strtotime($u['valid_until']) < time(); ?>
       <tr>
         <td><?= $u['id'] ?></td>
         <td><?= htmlspecialchars($u['name']) ?></td>
         <td><?= htmlspecialchars($u['police_station']) ?></td>
+        <td><?= htmlspecialchars($u['designation']) ?></td>
         <td><?= htmlspecialchars($u['username']) ?></td>
         <td><?= htmlspecialchars($u['mobile']) ?></td>
         <td><span class="badge b-<?= $u['status'] ?>"><?= strtoupper($u['status']) ?></span></td>
-        <td><?= $u['created_at'] ?></td>
         <td>
+          <?php if (empty($u['valid_until'])): ?>
+            <span class="badge b-active">UNLIMITED</span>
+          <?php elseif ($vExpired): ?>
+            <span class="badge b-disabled">EXPIRED
+              <?= date('d-m-Y', strtotime($u['valid_until'])) ?></span>
+          <?php else: ?>
+            <span class="badge b-pending">till
+              <?= date('d-m-Y', strtotime($u['valid_until'])) ?></span>
+          <?php endif; ?>
+          <form method="post" style="display:inline;white-space:nowrap">
+            <input type="hidden" name="do" value="set_validity">
+            <input type="hidden" name="uid" value="<?= $u['id'] ?>">
+            <input name="days" type="number" min="0" placeholder="days"
+                   style="width:60px;padding:5px" title="0 = unlimited">
+            <button class="gray" title="Set validity from today (0 = unlimited)">Set</button>
+          </form>
+        </td>
+        <td><?= $u['created_at'] ?></td>
+        <td style="white-space:nowrap">
           <form method="post" style="display:inline">
             <input type="hidden" name="uid" value="<?= $u['id'] ?>">
             <?php if ($u['status'] !== 'active'): ?>

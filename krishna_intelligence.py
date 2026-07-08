@@ -40,6 +40,7 @@ import logging
 import traceback
 import platform
 import getpass
+import webbrowser
 import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -452,9 +453,14 @@ class LoginWindow(ctk.CTkToplevel):
                                     wraplength=380, text_color="gray")
         self.lbl_msg.pack(pady=8)
 
+        self.btn_register = ctk.CTkButton(
+            frame, text="📝 New Registration (opens website)",
+            height=34, font=("Arial", 11), fg_color="#1E3A5F",
+            hover_color="#2563EB", command=self._open_registration)
+        self.btn_register.pack(fill="x", pady=(5, 0))
         ctk.CTkLabel(frame,
-                     text="New user? Register on the web panel —\n"
-                          "your login details arrive on WhatsApp.",
+                     text="Register with your details — confirmation\n"
+                          "arrives on WhatsApp (password stays secret).",
                      font=("Arial", 10), text_color="gray").pack(pady=(5, 0))
         ctk.CTkLabel(frame, text=APP_VERSION, font=("Courier", 9),
                      text_color="gray").pack(side="bottom", pady=5)
@@ -485,6 +491,15 @@ class LoginWindow(ctk.CTkToplevel):
             return
         self.auth.save_client_config(server)
         ForgotPasswordDialog(self, self.auth)
+
+    def _open_registration(self):
+        server = self.server_entry.get().strip()
+        if not server:
+            self._set_msg("Enter the Server URL first.", DANGER)
+            return
+        self.auth.save_client_config(server)
+        webbrowser.open(self.auth.server_url + "/register.php")
+        self._set_msg("Registration page opened in your browser.", ACCENT)
 
     def _saved_session_result(self, status):
         self._busy = False
@@ -679,10 +694,20 @@ class KrishnaIntelligence(ctk.CTk):
         profile = self.auth.profile or {}
         station = profile.get("police_station", "")
         operator = profile.get("name", profile.get("username", ""))
+        designation = profile.get("designation", "")
+        valid_until = profile.get("valid_until") or ""
         if station:
             self.station_label.configure(text=f"🏢 {station}")
         if operator:
-            self.operator_label.configure(text=f"👮 {operator}")
+            who = f"👮 {operator}"
+            if designation:
+                who += f" ({designation})"
+            self.operator_label.configure(text=who)
+        if valid_until:
+            self.validity_label.configure(
+                text=f"⏳ Valid till: {valid_until[:10]}")
+        else:
+            self.validity_label.configure(text="⏳ Validity: Unlimited")
         log.info("Logged in as %s (%s)", profile.get("username"), station)
 
         self.splash = SplashScreen(self)
@@ -784,7 +809,11 @@ class KrishnaIntelligence(ctk.CTk):
         self.operator_label = ctk.CTkLabel(who, text="👮 —",
                                            font=("Arial", 10),
                                            text_color=ACCENT)
-        self.operator_label.pack(pady=(0, 8))
+        self.operator_label.pack()
+        self.validity_label = ctk.CTkLabel(who, text="⏳ —",
+                                           font=("Arial", 9),
+                                           text_color="gray")
+        self.validity_label.pack(pady=(0, 8))
 
         # ---- batch control ----
         actions = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -1442,6 +1471,8 @@ class KrishnaIntelligence(ctk.CTk):
             profile = self.auth.profile or {}
             station = profile.get("police_station", "")
             operator = profile.get("name", profile.get("username", ""))
+            if profile.get("designation"):
+                operator = f"{operator} ({profile['designation']})"
 
             styles = getSampleStyleSheet()
             station_style = ParagraphStyle(

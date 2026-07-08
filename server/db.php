@@ -1,6 +1,15 @@
 <?php
 /** Krishna Intelligence — SQLite database bootstrap. */
 
+function ensure_column(PDO $pdo, string $table, string $col, string $ddl): void
+{
+    $cols = $pdo->query("PRAGMA table_info($table)")
+                ->fetchAll(PDO::FETCH_COLUMN, 1);
+    if (!in_array($col, $cols, true)) {
+        $pdo->exec("ALTER TABLE $table ADD COLUMN $ddl");
+    }
+}
+
 function db(): PDO
 {
     static $pdo = null;
@@ -21,10 +30,15 @@ function db(): PDO
         password_hash TEXT NOT NULL,
         name TEXT NOT NULL,
         police_station TEXT NOT NULL,
+        designation TEXT NOT NULL DEFAULT '',
         mobile TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',   -- pending|active|disabled
+        valid_until TEXT,                          -- NULL = unlimited
         created_at TEXT NOT NULL
     )");
+    // Migrations for databases created by older versions.
+    ensure_column($pdo, 'users', 'designation', "designation TEXT NOT NULL DEFAULT ''");
+    ensure_column($pdo, 'users', 'valid_until', "valid_until TEXT");
 
     $pdo->exec("CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

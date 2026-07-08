@@ -30,15 +30,21 @@ link on WhatsApp.
   રહે અને internet આવે એટલે આપોઆપ (કે SYNC button થી) upload થાય.
 
 ### 🌐 Web Panel (`server/` — PHP + SQLite)
-- 👥 **Admin panel** (`admin/`) — create users (name, police station, username,
-  password, WhatsApp mobile); credentials **auto-sent on WhatsApp**. Approve /
-  disable users, reset passwords via WhatsApp.
+- 👥 **Admin panel** (`admin/`) — create users (name, office/police station,
+  **designation (હોદ્દો)**, username, password, WhatsApp mobile); account
+  details **auto-sent on WhatsApp — password is NEVER sent**. Approve /
+  disable users, reset passwords.
+- ⏳ **Validity control** — admin sets how many days each user can use the
+  software (or unlimited); expired accounts cannot login or upload until the
+  admin extends them; validity changes notified on WhatsApp.
 - 📄 **Reports page** — every report with **copyable report link** and a
   **📲 Send Again** button that re-sends the WhatsApp message with the link.
 - 🖥 **Login history** — PC name, operating system, PC user and IP of every
   software login.
-- 📝 **Self-registration** (`register.php`) — WhatsApp OTP verification,
-  admin approval, success message on WhatsApp.
+- 📝 **Self-registration** (`register.php`, opens from the software's login
+  screen too) — full details form (name, office, designation), WhatsApp OTP
+  verification, admin approval; confirmation on WhatsApp with **server URL,
+  username and all details — never the password**.
 - 🔑 **Forgot-password API** — OTP on WhatsApp, old sessions killed on reset.
 - 🔗 Reports open only via secret token links; data folder blocked by
   `.htaccess`; passwords hashed; login rate-limited.

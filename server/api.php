@@ -34,8 +34,10 @@ if ($action === 'login') {
     $q->execute([$username]);
     $user = $q->fetch(PDO::FETCH_ASSOC);
 
+    $expired = $user && !empty($user['valid_until'])
+        && strtotime($user['valid_until']) < time();
     $ok = $user && password_verify($password, $user['password_hash'])
-        && $user['status'] === 'active';
+        && $user['status'] === 'active' && !$expired;
 
     // Every attempt is logged with the PC's basic information.
     $log = $pdo->prepare("INSERT INTO login_logs
@@ -53,6 +55,10 @@ if ($action === 'login') {
     }
     if ($user['status'] !== 'active') {
         json_out(['ok' => false, 'error' => 'Account is disabled. Contact admin.']);
+    }
+    if ($expired) {
+        json_out(['ok' => false,
+            'error' => 'Account validity expired — contact admin to extend.']);
     }
 
     $days = (int)cfg()['token_days'];
@@ -73,7 +79,9 @@ if ($action === 'login') {
             'username' => $user['username'],
             'name' => $user['name'],
             'police_station' => $user['police_station'],
+            'designation' => $user['designation'],
             'mobile' => $user['mobile'],
+            'valid_until' => $user['valid_until'],
         ],
     ]);
 }
@@ -85,13 +93,18 @@ if ($action === 'verify') {
         json_out(['ok' => false, 'error' => 'Token required.']);
     }
     $q = $pdo->prepare(
-        "SELECT s.*, u.username, u.name, u.police_station, u.mobile, u.status
+        "SELECT s.*, u.username, u.name, u.police_station, u.designation,
+                u.mobile, u.status, u.valid_until
          FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.token = ? AND s.expires_at > datetime('now')");
     $q->execute([$token]);
     $row = $q->fetch(PDO::FETCH_ASSOC);
     if (!$row || $row['status'] !== 'active') {
         json_out(['ok' => false, 'error' => 'Session expired or account disabled.']);
+    }
+    if (!empty($row['valid_until']) && strtotime($row['valid_until']) < time()) {
+        json_out(['ok' => false,
+            'error' => 'Account validity expired — contact admin to extend.']);
     }
     $pdo->prepare("UPDATE sessions SET last_seen = ? WHERE id = ?")
         ->execute([now(), $row['id']]);
@@ -101,7 +114,9 @@ if ($action === 'verify') {
             'username' => $row['username'],
             'name' => $row['name'],
             'police_station' => $row['police_station'],
+            'designation' => $row['designation'],
             'mobile' => $row['mobile'],
+            'valid_until' => $row['valid_until'],
         ],
     ]);
 }
@@ -110,12 +125,14 @@ if ($action === 'verify') {
 if ($action === 'upload_report') {
     $token = $_POST['token'] ?? '';
     $q = $pdo->prepare(
-        "SELECT s.user_id, u.mobile, u.police_station, u.status
+        "SELECT s.user_id, u.mobile, u.police_station, u.status, u.valid_until
          FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.token = ? AND s.expires_at > datetime('now')");
     $q->execute([$token]);
     $sess = $q->fetch(PDO::FETCH_ASSOC);
-    if (!$sess || $sess['status'] !== 'active') {
+    if (!$sess || $sess['status'] !== 'active'
+        || (!empty($sess['valid_until'])
+            && strtotime($sess['valid_until']) < time())) {
         json_out(['ok' => false, 'error' => 'Not authorised.']);
     }
 

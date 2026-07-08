@@ -14,11 +14,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['send_otp'])) {
         $name = trim($_POST['name'] ?? '');
         $station = trim($_POST['police_station'] ?? '');
+        $designation = trim($_POST['designation'] ?? '');
         $username = trim($_POST['username'] ?? '');
         $password = $_POST['password'] ?? '';
         $mobile = normalize_mobile($_POST['mobile'] ?? '');
 
-        if ($name === '' || $station === '' || $username === ''
+        if ($name === '' || $station === '' || $designation === ''
+            || $username === ''
             || strlen($password) < 6 || strlen($mobile) !== 12) {
             $err = 'Fill all fields (password min 6 chars, valid 10-digit mobile).';
         } elseif (!preg_match('/^[A-Za-z0-9_.-]{3,30}$/', $username)) {
@@ -35,6 +37,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else {
                 $_SESSION['reg'] = [
                     'name' => $name, 'police_station' => $station,
+                    'designation' => $designation,
                     'username' => $username,
                     'password_hash' => password_hash($password, PASSWORD_DEFAULT),
                     'mobile' => $mobile,
@@ -50,17 +53,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $step = 2;
         } else {
             $ins = db()->prepare("INSERT INTO users
-                (username, password_hash, name, police_station, mobile, status, created_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?)");
+                (username, password_hash, name, police_station, designation,
+                 mobile, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)");
             try {
                 $ins->execute([$reg['username'], $reg['password_hash'], $reg['name'],
-                    $reg['police_station'], $reg['mobile'], now()]);
+                    $reg['police_station'], $reg['designation'],
+                    $reg['mobile'], now()]);
+                // Full details on WhatsApp — the password is NEVER sent.
                 wa_send($reg['mobile'],
-                    "🦚 Krishna Intelligence\n✅ Registration successful!\n"
+                    "🦚 Krishna Intelligence\n"
+                    . "✅ Registration successful!\n"
+                    . "🙍 Name: {$reg['name']}\n"
+                    . "🏢 Office: {$reg['police_station']}\n"
+                    . "🎖 Designation: {$reg['designation']}\n"
                     . "👤 Username: {$reg['username']}\n"
-                    . "🏢 {$reg['police_station']}\n"
-                    . "Your software account is ready — it will activate "
-                    . "after admin approval.");
+                    . "📱 Mobile: {$reg['mobile']}\n"
+                    . "🌐 Server URL: " . cfg()['base_url'] . "\n"
+                    . "🔑 Password: the one you chose (kept secret)\n"
+                    . "Your account will activate after admin approval.");
                 unset($_SESSION['reg'], $_SESSION['reg_step']);
                 $step = 3;
             } catch (PDOException $e) {
@@ -100,7 +111,8 @@ button{width:100%;padding:12px;margin-top:14px;border:0;border-radius:7px;
 <?php if ($step === 1): ?>
   <form method="post">
     <input name="name" placeholder="Full Name" required>
-    <input name="police_station" placeholder="Police Station Name" required>
+    <input name="police_station" placeholder="Police Station / Office" required>
+    <input name="designation" placeholder="Designation / Post (હોદ્દો)" required>
     <input name="username" placeholder="Username" required>
     <input name="password" type="password" placeholder="Password (min 6 chars)" required>
     <input name="mobile" placeholder="WhatsApp Mobile (10 digits)" required>
