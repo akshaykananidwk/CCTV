@@ -100,6 +100,24 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    if ($do === 'resend_report' && isset($_POST['rid'])) {
+        $r = $pdo->prepare("SELECT r.*, u.mobile, u.police_station FROM reports r
+                            JOIN users u ON u.id = r.user_id WHERE r.id = ?");
+        $r->execute([(int)$_POST['rid']]);
+        if ($row = $r->fetch(PDO::FETCH_ASSOC)) {
+            $viewUrl = cfg()['base_url'] . '/view.php?t=' . $row['view_token'];
+            $m = "🦚 Krishna Intelligence\n"
+               . "📋 Case: {$row['case_id']}\n"
+               . "🏢 {$row['police_station']}\n"
+               . "👤 Persons: {$row['persons']} | 🚗 Vehicles: {$row['vehicles']}"
+               . " | 📸 Total: {$row['total']}\n"
+               . "🔗 View report: $viewUrl";
+            $ok = wa_send($row['mobile'], $m, $row['pdf_file'] ? $viewUrl : '');
+            $msg = $ok ? "WhatsApp sent again to {$row['mobile']}."
+                       : 'WhatsApp send failed — check API config.';
+        }
+    }
+
     if ($do === 'del_report' && isset($_POST['rid'])) {
         $r = $pdo->prepare("SELECT * FROM reports WHERE id = ?");
         $r->execute([(int)$_POST['rid']]);
@@ -160,8 +178,7 @@ button.gray{background:#374151}
 <?php if (!$logged): ?>
   <div class="login card" style="margin-top:12vh">
     <h1 style="color:#F97316;text-align:center">🦚 Krishna Intelligence</h1>
-    <p style="text-align:center;color:#06B6D4;font-size:12px">ADMIN PANEL —
-       LCB Technical Cell, Devbhoomi Dwarka</p>
+    <p style="text-align:center;color:#06B6D4;font-size:12px">ADMIN PANEL</p>
     <form method="post">
       <input type="hidden" name="do" value="admin_login">
       <input name="u" placeholder="Admin username" style="width:100%;box-sizing:border-box" required>
@@ -272,10 +289,12 @@ $totL = $pdo->query("SELECT COUNT(*) FROM login_logs")->fetchColumn();
     <h2>📄 Uploaded Case Reports</h2>
     <table>
       <tr><th>Time</th><th>Case ID</th><th>Operator</th><th>Police Station</th>
-          <th>👤</th><th>🚗</th><th>📸</th><th>View</th><th></th></tr>
+          <th>👤</th><th>🚗</th><th>📸</th><th>View</th>
+          <th>Report Link</th><th>Actions</th></tr>
       <?php foreach ($pdo->query(
           "SELECT r.*, u.username, u.police_station FROM reports r
-           JOIN users u ON u.id = r.user_id ORDER BY r.id DESC LIMIT 300") as $r): ?>
+           JOIN users u ON u.id = r.user_id ORDER BY r.id DESC LIMIT 300") as $r):
+          $link = cfg()['base_url'] . '/view.php?t=' . $r['view_token']; ?>
       <tr>
         <td><?= $r['created_at'] ?></td>
         <td><?= htmlspecialchars($r['case_id']) ?></td>
@@ -293,7 +312,20 @@ $totL = $pdo->query("SELECT COUNT(*) FROM login_logs")->fetchColumn();
           <?php endif; ?>
         </td>
         <td>
-          <form method="post" onsubmit="return confirm('Delete this report?')">
+          <input readonly value="<?= htmlspecialchars($link) ?>"
+                 style="width:190px;font-size:11px"
+                 onclick="this.select();document.execCommand('copy');
+                          this.style.borderColor='#10B981';"
+                 title="Click to copy link">
+        </td>
+        <td style="white-space:nowrap">
+          <form method="post" style="display:inline">
+            <input type="hidden" name="do" value="resend_report">
+            <input type="hidden" name="rid" value="<?= $r['id'] ?>">
+            <button title="Send the report link again on WhatsApp">📲 Send Again</button>
+          </form>
+          <form method="post" style="display:inline"
+                onsubmit="return confirm('Delete this report?')">
             <input type="hidden" name="do" value="del_report">
             <input type="hidden" name="rid" value="<?= $r['id'] ?>">
             <button class="warn">Delete</button>

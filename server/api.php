@@ -1,7 +1,7 @@
 <?php
 /**
  * Krishna Intelligence — Desktop app API.
- * Actions: login | verify | upload_report
+ * Actions: login | verify | upload_report | forgot_request | forgot_reset
  */
 require_once __DIR__ . '/helpers.php';
 
@@ -171,6 +171,60 @@ if ($action === 'upload_report') {
     wa_send($sess['mobile'], $msg, $pdfFile ? $viewUrl : '');
 
     json_out(['ok' => true, 'view_url' => $viewUrl]);
+}
+
+// ------------------------------------------------------- forgot_request ----
+if ($action === 'forgot_request') {
+    $username = trim($_POST['username'] ?? '');
+    if ($username === '') {
+        json_out(['ok' => false, 'error' => 'Username required.']);
+    }
+    $q = $pdo->prepare("SELECT * FROM users WHERE username = ?");
+    $q->execute([$username]);
+    $user = $q->fetch(PDO::FETCH_ASSOC);
+    if (!$user || $user['status'] !== 'active') {
+        json_out(['ok' => false, 'error' => 'User not found or not active.']);
+    }
+    $sent = otp_send($user['mobile'], 'forgot');
+    if ($sent === 'rate_limit') {
+        json_out(['ok' => false,
+            'error' => 'OTP limit reached — try again after 10 minutes.']);
+    }
+    if ($sent !== 'ok') {
+        json_out(['ok' => false,
+            'error' => 'Could not send WhatsApp OTP — contact admin.']);
+    }
+    json_out(['ok' => true,
+        'mobile_hint' => '******' . substr($user['mobile'], -4)]);
+}
+
+// --------------------------------------------------------- forgot_reset ----
+if ($action === 'forgot_reset') {
+    $username = trim($_POST['username'] ?? '');
+    $otp = trim($_POST['otp'] ?? '');
+    $newPass = $_POST['new_password'] ?? '';
+    if ($username === '' || $otp === '' || strlen($newPass) < 6) {
+        json_out(['ok' => false,
+            'error' => 'OTP and a new password (min 6 chars) required.']);
+    }
+    $q = $pdo->prepare("SELECT * FROM users WHERE username = ?");
+    $q->execute([$username]);
+    $user = $q->fetch(PDO::FETCH_ASSOC);
+    if (!$user || $user['status'] !== 'active') {
+        json_out(['ok' => false, 'error' => 'User not found or not active.']);
+    }
+    if (!otp_verify($user['mobile'], $otp, 'forgot')) {
+        json_out(['ok' => false, 'error' => 'Wrong or expired OTP.']);
+    }
+    $pdo->prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+        ->execute([password_hash($newPass, PASSWORD_DEFAULT), $user['id']]);
+    // Old software sessions become invalid after a password reset.
+    $pdo->prepare("DELETE FROM sessions WHERE user_id = ?")
+        ->execute([$user['id']]);
+    wa_send($user['mobile'],
+        "🦚 Krishna Intelligence\n🔑 Password changed for '{$user['username']}'.\n"
+        . "If this was not you, contact admin immediately.");
+    json_out(['ok' => true]);
 }
 
 json_out(['ok' => false, 'error' => 'Unknown action.']);

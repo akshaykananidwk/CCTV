@@ -1,7 +1,6 @@
 <?php
 /**
  * Krishna Intelligence — Server Configuration
- * LCB Technical Cell, Devbhoomi Dwarka
  *
  * !!! IMPORTANT !!!
  * 1) Fill in your WhatsApp API details below (from bulk.akdwk.in).

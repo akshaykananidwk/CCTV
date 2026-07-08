@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 *.pt
-LCB_Forensic_Data/
 Krishna_Forensic_Data/
 *.log
 venv/

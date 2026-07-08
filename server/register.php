@@ -28,8 +28,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $q->execute([$username]);
             if ($q->fetch()) {
                 $err = 'Username already taken.';
-            } elseif (!otp_send($mobile, 'register')) {
-                $err = 'Could not send OTP (limit reached or WhatsApp API not configured).';
+            } elseif (($sent = otp_send($mobile, 'register')) !== 'ok') {
+                $err = $sent === 'rate_limit'
+                    ? 'OTP limit reached — try again after 10 minutes.'
+                    : 'Could not send WhatsApp OTP — contact admin.';
             } else {
                 $_SESSION['reg'] = [
                     'name' => $name, 'police_station' => $station,
@@ -94,7 +96,7 @@ button{width:100%;padding:12px;margin-top:14px;border:0;border-radius:7px;
 <body>
 <div class="card">
 <h1>🦚 Krishna Intelligence</h1>
-<h2>LCB Technical Cell | Devbhoomi Dwarka — New Registration</h2>
+<h2>New Registration</h2>
 <?php if ($step === 1): ?>
   <form method="post">
     <input name="name" placeholder="Full Name" required>

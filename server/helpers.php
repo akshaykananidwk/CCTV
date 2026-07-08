@@ -83,8 +83,11 @@ function wa_send(string $mobile, string $message, string $mediaUrl = ''): bool
     return true;
 }
 
-/** Create + send an OTP for a mobile number. Returns true when sent. */
-function otp_send(string $mobile, string $purpose): bool
+/**
+ * Create + send an OTP for a mobile number.
+ * Returns 'ok', 'rate_limit' or 'wa_failed'.
+ */
+function otp_send(string $mobile, string $purpose): string
 {
     $pdo = db();
     // Basic rate-limit: max 3 OTPs per mobile per 10 minutes.
@@ -92,15 +95,16 @@ function otp_send(string $mobile, string $purpose): bool
                         WHERE mobile = ? AND created_at > datetime('now', '-10 minutes')");
     $q->execute([normalize_mobile($mobile)]);
     if ((int)$q->fetchColumn() >= 3) {
-        return false;
+        return 'rate_limit';
     }
     $code = strval(random_int(100000, 999999));
     $mins = (int)cfg()['otp_minutes'];
     $ins = $pdo->prepare("INSERT INTO otps (mobile, code, purpose, expires_at, created_at)
                           VALUES (?, ?, ?, datetime('now', '+{$mins} minutes'), datetime('now'))");
     $ins->execute([normalize_mobile($mobile), $code, $purpose]);
-    return wa_send($mobile,
+    $sent = wa_send($mobile,
         "Krishna Intelligence OTP: $code\nValid for {$mins} minutes. Do not share.");
+    return $sent ? 'ok' : 'wa_failed';
 }
 
 /** Verify an OTP; marks it used on success. */

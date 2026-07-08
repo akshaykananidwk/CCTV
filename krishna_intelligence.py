@@ -1,7 +1,6 @@
 """
 Krishna Intelligence — Forensic CCTV Video Analysis Suite
-LCB Technical Cell, Devbhoomi Dwarka
-Version 13.0 Pro Enterprise
+Version 14.0 Pro Enterprise
 
 Features:
   - Secure login: the app authenticates against the Krishna web panel on
@@ -13,11 +12,13 @@ Features:
   - Unique-ID evidence capture (one photo per tracked object, per video)
   - Image enhancement (fast CLAHE + sharpening) and Night Vision mode
   - Live evidence gallery, timeline log, and live statistics
-  - Case management: per-case folders, JSON case report
-  - Export: CSV database + PDF photo report with the police-station header
-  - Auto-upload: the finished report (PDF + JSON, never the videos) is
-    uploaded to the web panel and a WhatsApp message with the view link is
-    sent to the operator's registered mobile number
+  - Case management: per-case evidence folders on the PC
+  - Reports live ONLY on the web panel: after every scan (even aborted)
+    the report (PDF + JSON, never the videos) is uploaded automatically —
+    no local report copies are kept — and a WhatsApp message with the view
+    link goes to the operator's registered mobile number; failed uploads
+    stay queued and are re-sent when internet returns
+  - Forgot Password from the login screen (WhatsApp OTP)
   - Pause / Resume / Abort controls, responsive video display
 """
 
@@ -29,12 +30,12 @@ import cv2
 import os
 import sys
 import subprocess
+import shutil
 import threading
 import time
 import numpy as np
 import queue
 import json
-import csv
 import logging
 import traceback
 import platform
@@ -47,9 +48,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 APP_NAME = "Krishna Intelligence"
-APP_VERSION = "v13.0 Pro Enterprise"
-ORG_LINE_1 = "LCB Technical Cell"
-ORG_LINE_2 = "DEVBHOOMI DWARKA"
+APP_VERSION = "v14.0 Pro Enterprise"
 
 CLIENT_CONFIG_FILE = "client_config.json"
 SESSION_DIR = os.path.join(os.path.expanduser("~"), ".krishna_intelligence")
@@ -103,7 +102,6 @@ class AuthClient:
         self.token = ""
         self.expires_at = None          # datetime
         self.profile = {}               # name, username, police_station, mobile
-        self.offline_mode = False
         self._load_client_config()
 
     # ------------------------------------------------------------- config --
@@ -202,7 +200,6 @@ class AuthClient:
         self.token = out["token"]
         self.expires_at = datetime.now() + timedelta(days=int(out.get("valid_days", 7)))
         self.profile = out.get("profile", {})
-        self.offline_mode = False
         self._save_session()
         return True, "Login successful."
 
@@ -222,6 +219,34 @@ class AuthClient:
             self._save_session()
             return "ok"
         return "invalid"
+
+    def forgot_request(self, username):
+        """Ask the server to send a password-reset OTP on WhatsApp."""
+        if not self.server_url:
+            return False, "Server URL is not set."
+        try:
+            out = self._post("forgot_request", {"username": username})
+        except requests.RequestException:
+            return False, "Cannot reach the server. Check internet."
+        except ValueError:
+            return False, "Invalid response from server."
+        if out.get("ok"):
+            return True, out.get("mobile_hint", "your WhatsApp number")
+        return False, out.get("error", "Request failed.")
+
+    def forgot_reset(self, username, otp, new_password):
+        """Reset the password using the WhatsApp OTP."""
+        try:
+            out = self._post("forgot_reset", {
+                "username": username, "otp": otp,
+                "new_password": new_password})
+        except requests.RequestException:
+            return False, "Cannot reach the server. Check internet."
+        except ValueError:
+            return False, "Invalid response from server."
+        if out.get("ok"):
+            return True, "Password changed."
+        return False, out.get("error", "Reset failed.")
 
     def upload_report(self, case_id, pdf_path, json_path, stats):
         """Upload the case report (PDF + JSON only). Returns (ok, link_or_error)."""
@@ -259,6 +284,108 @@ class AuthClient:
         return False, out.get("error", "Upload rejected by server.")
 
 
+# ====================================================== forgot password ====
+class ForgotPasswordDialog(ctk.CTkToplevel):
+    """Password reset via WhatsApp OTP: username -> OTP -> new password."""
+
+    def __init__(self, parent, auth):
+        super().__init__(parent)
+        self.auth = auth
+        self.title("Forgot Password")
+        self.geometry("400x440")
+        self.configure(fg_color=BG_DARK)
+        self.resizable(False, False)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 200
+        y = (self.winfo_screenheight() // 2) - 220
+        self.geometry(f"+{x}+{y}")
+
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(expand=True, fill="both", padx=25, pady=15)
+        ctk.CTkLabel(frame, text="🔑 Forgot Password",
+                     font=("Arial Black", 18),
+                     text_color=HIGHLIGHT).pack(pady=(5, 10))
+
+        self.user_entry = ctk.CTkEntry(frame, height=36,
+                                       placeholder_text="Username")
+        self.user_entry.pack(fill="x", pady=4)
+        self.btn_otp = ctk.CTkButton(frame, text="📲 Send OTP on WhatsApp",
+                                     height=38, fg_color=ACCENT,
+                                     hover_color="#0891B2",
+                                     command=self._send_otp)
+        self.btn_otp.pack(fill="x", pady=(4, 10))
+
+        self.otp_entry = ctk.CTkEntry(frame, height=36,
+                                      placeholder_text="6-digit OTP")
+        self.otp_entry.pack(fill="x", pady=4)
+        self.new_pass_entry = ctk.CTkEntry(frame, height=36, show="•",
+                                           placeholder_text="New Password (min 6)")
+        self.new_pass_entry.pack(fill="x", pady=4)
+        self.btn_reset = ctk.CTkButton(frame, text="✅ Reset Password",
+                                       height=40, fg_color=SUCCESS,
+                                       hover_color="#059669",
+                                       command=self._reset)
+        self.btn_reset.pack(fill="x", pady=(8, 4))
+
+        self.lbl_msg = ctk.CTkLabel(frame,
+                                    text="Enter your username and press Send OTP.",
+                                    font=("Arial", 11), wraplength=330,
+                                    text_color="gray")
+        self.lbl_msg.pack(pady=8)
+
+    def _send_otp(self):
+        username = self.user_entry.get().strip()
+        if not username:
+            self.lbl_msg.configure(text="Enter your username.", text_color=DANGER)
+            return
+        self.btn_otp.configure(state="disabled", text="Sending...")
+
+        def worker():
+            ok, result = self.auth.forgot_request(username)
+            self.after(0, lambda: self._otp_sent(ok, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _otp_sent(self, ok, result):
+        self.btn_otp.configure(state="normal", text="📲 Send OTP on WhatsApp")
+        if ok:
+            self.lbl_msg.configure(
+                text=f"OTP sent on WhatsApp to {result}. Valid 5 minutes.",
+                text_color=SUCCESS)
+        else:
+            self.lbl_msg.configure(text=result, text_color=DANGER)
+
+    def _reset(self):
+        username = self.user_entry.get().strip()
+        otp = self.otp_entry.get().strip()
+        new_pass = self.new_pass_entry.get()
+        if not username or not otp or len(new_pass) < 6:
+            self.lbl_msg.configure(
+                text="Fill username, OTP and a new password (min 6 chars).",
+                text_color=DANGER)
+            return
+        self.btn_reset.configure(state="disabled", text="Resetting...")
+
+        def worker():
+            ok, msgtext = self.auth.forgot_reset(username, otp, new_pass)
+            self.after(0, lambda: self._reset_done(ok, msgtext))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _reset_done(self, ok, msgtext):
+        self.btn_reset.configure(state="normal", text="✅ Reset Password")
+        if ok:
+            messagebox.showinfo(
+                "Password Changed",
+                "Password changed successfully!\nLogin with the new password.",
+                parent=self)
+            self.destroy()
+        else:
+            self.lbl_msg.configure(text=msgtext, text_color=DANGER)
+
+
 # ============================================================= login window =
 class LoginWindow(ctk.CTkToplevel):
     """Blocking login gate shown before the main application starts."""
@@ -291,10 +418,7 @@ class LoginWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(frame, text="🦚", font=("Arial", 52)).pack(pady=(10, 0))
         ctk.CTkLabel(frame, text=APP_NAME, font=("Arial Black", 24, "bold"),
-                     text_color=HIGHLIGHT).pack()
-        ctk.CTkLabel(frame, text=f"{ORG_LINE_1} | {ORG_LINE_2}",
-                     font=("Courier", 11, "bold"),
-                     text_color=ACCENT).pack(pady=(0, 15))
+                     text_color=HIGHLIGHT).pack(pady=(0, 15))
 
         self.server_entry = ctk.CTkEntry(frame, height=38,
                                          placeholder_text="Server URL (https://...)")
@@ -315,6 +439,14 @@ class LoginWindow(ctk.CTkToplevel):
                                        fg_color=SUCCESS, hover_color="#059669",
                                        command=self._do_login)
         self.btn_login.pack(fill="x", pady=(15, 5))
+
+        self.btn_forgot = ctk.CTkButton(frame, text="Forgot Password?",
+                                        height=30, font=("Arial", 11),
+                                        fg_color="transparent",
+                                        hover_color=PANEL_BG,
+                                        text_color=ACCENT,
+                                        command=self._forgot_password)
+        self.btn_forgot.pack(pady=(0, 2))
 
         self.lbl_msg = ctk.CTkLabel(frame, text="", font=("Arial", 11),
                                     wraplength=380, text_color="gray")
@@ -346,15 +478,23 @@ class LoginWindow(ctk.CTkToplevel):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _forgot_password(self):
+        server = self.server_entry.get().strip()
+        if not server:
+            self._set_msg("Enter the Server URL first.", DANGER)
+            return
+        self.auth.save_client_config(server)
+        ForgotPasswordDialog(self, self.auth)
+
     def _saved_session_result(self, status):
         self._busy = False
         if status == "ok":
-            self._finish(offline=False)
+            self._finish()
         elif status == "offline":
-            # Server unreachable but the local session is still inside its
-            # 7-day window: allow work, disable uploads.
-            self.auth.offline_mode = True
-            self._finish(offline=True)
+            # Internet is mandatory — without the server nothing opens.
+            self._set_msg("⚠ Internet is required. Could not reach the "
+                          "server — connect internet and login again.",
+                          DANGER)
         else:
             self.auth.clear_session()
             self._set_msg("Session expired — please login again.", WARNING)
@@ -383,13 +523,13 @@ class LoginWindow(ctk.CTkToplevel):
         self._busy = False
         self.btn_login.configure(state="normal", text="🔐 LOGIN")
         if ok:
-            self._finish(offline=False)
+            self._finish()
         else:
             self._set_msg(message, DANGER)
 
-    def _finish(self, offline):
+    def _finish(self):
         self.destroy()
-        self.on_success(offline)
+        self.on_success()
 
 
 # ================================================================== splash ==
@@ -429,11 +569,7 @@ class SplashScreen(ctk.CTkToplevel):
 
         ctk.CTkLabel(main_frame, text=APP_NAME,
                      font=("Arial Black", 26, "bold"),
-                     text_color=HIGHLIGHT).pack(pady=5)
-        ctk.CTkLabel(main_frame, text=ORG_LINE_1,
-                     font=("Courier", 13, "bold"), text_color=ACCENT).pack()
-        ctk.CTkLabel(main_frame, text=ORG_LINE_2,
-                     font=("Courier", 11, "bold"), text_color=GOLD).pack(pady=5)
+                     text_color=HIGHLIGHT).pack(pady=10)
 
         self.progress = ctk.CTkProgressBar(main_frame, width=400, height=8,
                                            progress_color=ACCENT)
@@ -495,7 +631,7 @@ class KrishnaIntelligence(ctk.CTk):
         super().__init__()
         self.withdraw()
 
-        self.title(f"🦚 {APP_NAME} | {ORG_LINE_1.upper()} {ORG_LINE_2}")
+        self.title(f"🦚 {APP_NAME}")
         self.geometry("1400x800")
         self._maximize_window()
         self.configure(fg_color=BG_DARK)
@@ -539,7 +675,7 @@ class KrishnaIntelligence(ctk.CTk):
         self.login_window = LoginWindow(self, self.auth, self._on_logged_in)
 
     # ---------------------------------------------------------- login flow -
-    def _on_logged_in(self, offline):
+    def _on_logged_in(self):
         profile = self.auth.profile or {}
         station = profile.get("police_station", "")
         operator = profile.get("name", profile.get("username", ""))
@@ -547,14 +683,12 @@ class KrishnaIntelligence(ctk.CTk):
             self.station_label.configure(text=f"🏢 {station}")
         if operator:
             self.operator_label.configure(text=f"👮 {operator}")
-        if offline:
-            self.lbl_status.configure(text="⚠ OFFLINE MODE (no upload)",
-                                      text_color=WARNING)
-        log.info("Logged in as %s (%s) offline=%s",
-                 profile.get("username"), station, offline)
+        log.info("Logged in as %s (%s)", profile.get("username"), station)
 
         self.splash = SplashScreen(self)
         threading.Thread(target=self._load_model, daemon=True).start()
+        # Push any reports that could not be uploaded last time.
+        self.after(4000, lambda: self.sync_reports(silent=True))
 
     def logout(self):
         if self.is_scanning:
@@ -607,9 +741,8 @@ class KrishnaIntelligence(ctk.CTk):
 
     def on_splash_closed(self):
         if self.model_status == "ready":
-            if not self.auth.offline_mode:
-                self.lbl_status.configure(text="✅ System Ready",
-                                          text_color=SUCCESS)
+            self.lbl_status.configure(text="✅ System Ready",
+                                      text_color=SUCCESS)
         elif self.model_status == "failed":
             self.lbl_status.configure(text="❌ AI Model Failed", text_color=DANGER)
             messagebox.showerror(
@@ -639,9 +772,6 @@ class KrishnaIntelligence(ctk.CTk):
         ctk.CTkLabel(header, text="🦚 Krishna", font=("Arial Black", 24),
                      text_color=BG_DARK).pack(pady=(15, 0))
         ctk.CTkLabel(header, text="INTELLIGENCE", font=("Arial Black", 14),
-                     text_color=BG_DARK).pack()
-        ctk.CTkLabel(header, text=ORG_LINE_1.upper(),
-                     font=("Courier", 10, "bold"),
                      text_color=BG_DARK).pack(pady=(0, 15))
 
         # ---- operator / police-station strip ----
@@ -735,26 +865,14 @@ class KrishnaIntelligence(ctk.CTk):
         self.night_switch = ctk.CTkSwitch(settings, text="🌙 Night Vision Mode",
                                           font=("Arial", 11),
                                           progress_color=PURPLE)
-        self.night_switch.pack(pady=(5, 5), padx=15, anchor="w")
+        self.night_switch.pack(pady=(5, 10), padx=15, anchor="w")
 
-        self.upload_switch = ctk.CTkSwitch(settings,
-                                           text="☁ Auto-Upload Report",
-                                           font=("Arial", 11),
-                                           progress_color=ACCENT)
-        self.upload_switch.pack(pady=(5, 10), padx=15, anchor="w")
-        self.upload_switch.select()
-
-        # ---- export ----
-        exp = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        exp.pack(pady=5, padx=10, fill="x")
-        ctk.CTkButton(exp, text="📊 EXPORT CSV", font=("Arial", 11, "bold"),
-                      fg_color=PURPLE, hover_color="#7C3AED", height=40,
-                      command=self.export_csv).pack(side="left", expand=True,
-                                                    padx=(0, 5), fill="x")
-        ctk.CTkButton(exp, text="📄 EXPORT PDF", font=("Arial", 11, "bold"),
-                      fg_color="#DB2777", hover_color="#BE185D", height=40,
-                      command=self.export_pdf).pack(side="right", expand=True,
-                                                    padx=(5, 0), fill="x")
+        # Reports always upload to the web panel; this only retries the
+        # queue when an earlier upload failed (no internet at that time).
+        ctk.CTkButton(self.sidebar, text="☁ SYNC PENDING REPORTS",
+                      font=("Arial", 11, "bold"), fg_color=PURPLE,
+                      hover_color="#7C3AED", height=40,
+                      command=self.sync_reports).pack(pady=5, padx=10, fill="x")
         ctk.CTkButton(self.sidebar, text="📁 OPEN DATABASE",
                       font=("Arial", 11, "bold"), fg_color="#34495E",
                       hover_color=ACCENT, height=40,
@@ -908,7 +1026,6 @@ class KrishnaIntelligence(ctk.CTk):
             "color_filter": self.color_filter.get(),
             "night_mode": bool(self.night_switch.get()),
             "enhance": bool(self.enhance_switch.get()),
-            "auto_upload": bool(self.upload_switch.get()),
             "conf": self.conf_threshold,
         }
 
@@ -1185,35 +1302,13 @@ class KrishnaIntelligence(ctk.CTk):
         if not self.current_case_dir:
             return
 
-        profile = self.auth.profile or {}
-        report = {
-            "app": f"{APP_NAME} {APP_VERSION}",
-            "case_id": self.current_case_id,
-            "police_station": profile.get("police_station", ""),
-            "operator": profile.get("name", profile.get("username", "")),
-            "generated": datetime.now().isoformat(timespec="seconds"),
-            "started": self.scan_started_at.isoformat(timespec="seconds")
-            if self.scan_started_at else None,
-            "status": "ABORTED" if aborted else "COMPLETED",
-            "videos": [os.path.basename(v) for v in self.video_list],
-            "stats": {"persons": self.stats.get("persons", 0),
-                      "vehicles": self.stats.get("vehicles", 0),
-                      "total_evidence": len(self.evidence_database)},
-            "evidence": self.evidence_database,
-        }
-        json_path = os.path.join(self.current_case_dir, "report.json")
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2, ensure_ascii=False)
-        except OSError as exc:
-            log.error("Could not write report.json: %s", exc)
-
-        # Auto-generate the PDF report inside the case folder.
-        pdf_path = os.path.join(self.current_case_dir, "report.pdf")
-        pdf_ok, pdf_err = self._build_pdf(pdf_path)
-        if not pdf_ok:
-            log.warning("Auto PDF failed: %s", pdf_err)
-            pdf_path = ""
+        # Reports are NEVER kept as local files — the report (PDF + JSON)
+        # is built into the hidden upload queue and pushed to the web
+        # panel. Without internet the operator gets no report; it stays
+        # queued and uploads automatically when internet returns.
+        queued = False
+        if self.evidence_database:
+            queued = self._queue_report(aborted) is not None
 
         if aborted:
             self.lbl_status.configure(text="⏹ Analysis Aborted",
@@ -1223,7 +1318,8 @@ class KrishnaIntelligence(ctk.CTk):
                 "Aborted",
                 f"Analysis was aborted.\n"
                 f"📸 Evidence captured so far: {len(self.evidence_database)}\n"
-                f"📁 Saved in: {self.current_case_dir}")
+                "☁ The report of captured evidence is being uploaded "
+                "to the web panel.")
         else:
             self.lbl_status.configure(text="Analysis Complete",
                                       text_color=SUCCESS)
@@ -1232,32 +1328,96 @@ class KrishnaIntelligence(ctk.CTk):
                 "Compiled",
                 f"Case Analysis Successful!\n"
                 f"📸 Evidence images: {len(self.evidence_database)}\n"
-                f"📁 Saved in: {self.current_case_dir}")
+                "☁ The report is being uploaded to the web panel — the "
+                "view link arrives on WhatsApp.")
         log.info("Scan finished | aborted=%s evidence=%d",
                  aborted, len(self.evidence_database))
 
-        # Auto-upload ONLY the report (PDF + JSON) — never the videos.
-        if (not aborted and self.scan_config.get("auto_upload")
-                and self.evidence_database):
-            self._start_report_upload(json_path, pdf_path)
+        if queued:
+            self.sync_reports(silent=True)
 
     # ------------------------------------------------------------- upload --
-    def _start_report_upload(self, json_path, pdf_path):
-        if self.auth.offline_mode or not self.auth.token:
-            self.gui_queue.put(("timeline",
-                                "☁ Offline mode — report NOT uploaded.\n"))
+    def _queue_report(self, aborted):
+        """Build the report (PDF + JSON + meta) into the hidden upload
+        queue. Returns the queue folder, or None on failure."""
+        profile = self.auth.profile or {}
+        qdir = os.path.join(
+            self.base_dir, ".upload_queue",
+            f"{self.current_case_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}")
+        try:
+            os.makedirs(qdir, exist_ok=True)
+            report = {
+                "app": f"{APP_NAME} {APP_VERSION}",
+                "case_id": self.current_case_id,
+                "police_station": profile.get("police_station", ""),
+                "operator": profile.get("name", profile.get("username", "")),
+                "generated": datetime.now().isoformat(timespec="seconds"),
+                "started": self.scan_started_at.isoformat(timespec="seconds")
+                if self.scan_started_at else None,
+                "status": "ABORTED" if aborted else "COMPLETED",
+                "videos": [os.path.basename(v) for v in self.video_list],
+                "stats": {"persons": self.stats.get("persons", 0),
+                          "vehicles": self.stats.get("vehicles", 0),
+                          "total_evidence": len(self.evidence_database)},
+                "evidence": self.evidence_database,
+            }
+            with open(os.path.join(qdir, "report.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+
+            pdf_ok, pdf_err = self._build_pdf(os.path.join(qdir, "report.pdf"))
+            if not pdf_ok:
+                log.warning("PDF build failed: %s", pdf_err)
+
+            meta = {"case_id": self.current_case_id,
+                    "persons": self.stats.get("persons", 0),
+                    "vehicles": self.stats.get("vehicles", 0),
+                    "total": len(self.evidence_database)}
+            with open(os.path.join(qdir, "meta.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(meta, f)
+            return qdir
+        except OSError as exc:
+            log.error("Could not queue report: %s", exc)
+            return None
+
+    def sync_reports(self, silent=False):
+        """Upload every queued report in a background thread."""
+        qroot = os.path.join(self.base_dir, ".upload_queue")
+        dirs = []
+        if os.path.isdir(qroot):
+            dirs = sorted(os.path.join(qroot, d) for d in os.listdir(qroot)
+                          if os.path.isdir(os.path.join(qroot, d)))
+        if not dirs:
+            if not silent:
+                self.gui_queue.put(("timeline",
+                                    "☁ No pending reports — all synced.\n"))
             return
-        self.lbl_status.configure(text="☁ Uploading report...",
+        if not self.auth.token:
+            self.gui_queue.put(("timeline", "☁ Not logged in — cannot sync.\n"))
+            return
+        self.lbl_status.configure(text="☁ Uploading report(s)...",
                                   text_color=ACCENT)
-        case_id = self.current_case_id
-        stats = {"persons": self.stats.get("persons", 0),
-                 "vehicles": self.stats.get("vehicles", 0),
-                 "total": len(self.evidence_database)}
 
         def worker():
-            ok, result = self.auth.upload_report(case_id, pdf_path,
-                                                 json_path, stats)
-            self.gui_queue.put(("upload_result", ok, result))
+            for qdir in dirs:
+                try:
+                    with open(os.path.join(qdir, "meta.json"),
+                              encoding="utf-8") as f:
+                        meta = json.load(f)
+                except (OSError, ValueError):
+                    shutil.rmtree(qdir, ignore_errors=True)
+                    continue
+                ok, result = self.auth.upload_report(
+                    meta.get("case_id", "CASE"),
+                    os.path.join(qdir, "report.pdf"),
+                    os.path.join(qdir, "report.json"), meta)
+                if ok:
+                    shutil.rmtree(qdir, ignore_errors=True)
+                self.gui_queue.put(("upload_result", ok, result,
+                                    meta.get("case_id", "")))
+                if not ok:
+                    break  # server unreachable — keep the rest queued
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1303,7 +1463,6 @@ class KrishnaIntelligence(ctk.CTk):
                 story.append(Spacer(1, 4))
             story += [
                 Paragraph(f"{APP_NAME} — Forensic Evidence Report", title_style),
-                Paragraph(f"{ORG_LINE_1}, {ORG_LINE_2}", styles["Heading4"]),
                 Spacer(1, 8),
                 Paragraph(f"<b>Case ID:</b> {self.current_case_id or '-'}", small),
                 Paragraph(f"<b>Operator:</b> {operator or '-'}", small),
@@ -1354,42 +1513,6 @@ class KrishnaIntelligence(ctk.CTk):
         except Exception as exc:
             log.error("PDF build failed: %s\n%s", exc, traceback.format_exc())
             return False, str(exc)
-
-    # ------------------------------------------------------------- exports -
-    def export_csv(self):
-        if not self.evidence_database:
-            messagebox.showwarning("No Data", "No evidence to export!")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV File", "*.csv")],
-            initialfile=f"{self.current_case_id or 'case'}_evidence.csv")
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=list(self.evidence_database[0].keys()))
-                writer.writeheader()
-                writer.writerows(self.evidence_database)
-            messagebox.showinfo("Exported", "CSV Database Exported Successfully!")
-        except OSError as exc:
-            messagebox.showerror("Export Failed", f"Could not write CSV:\n{exc}")
-
-    def export_pdf(self):
-        if not self.evidence_database:
-            messagebox.showwarning("No Data", "No evidence to export!")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".pdf", filetypes=[("PDF File", "*.pdf")],
-            initialfile=f"{self.current_case_id or 'case'}_report.pdf")
-        if not path:
-            return
-        ok, err = self._build_pdf(path)
-        if ok:
-            messagebox.showinfo("Exported", "PDF Report Exported Successfully!")
-            open_path(path)
-        else:
-            messagebox.showerror("Export Failed", f"Could not create PDF:\n{err}")
 
     # --------------------------------------------------------------- misc --
     def open_folder(self):
@@ -1463,32 +1586,36 @@ class KrishnaIntelligence(ctk.CTk):
                         self.process_next_video()
 
                 elif kind == "upload_result":
-                    ok, result = msg[1], msg[2]
+                    ok, result, case_id = msg[1], msg[2], msg[3]
                     if ok:
                         self.lbl_status.configure(text="☁ Report Uploaded ✅",
                                                   text_color=SUCCESS)
                         self.timeline_text.insert(
-                            tk.END, f"☁ Report uploaded: {result}\n"
-                                    "📲 WhatsApp message sent.\n")
+                            tk.END, f"☁ Report uploaded ({case_id}): "
+                                    f"{result}\n📲 WhatsApp message sent.\n")
                         self.timeline_text.see(tk.END)
                         messagebox.showinfo(
                             "Uploaded",
-                            "Report uploaded to the web panel!\n"
+                            f"Report uploaded to the web panel!\n"
+                            f"📋 Case: {case_id}\n"
                             "📲 A WhatsApp message with the report link "
-                            "was sent to your registered number.\n\n"
-                            f"🔗 {result}")
+                            "was sent to your registered number.")
                     else:
-                        self.lbl_status.configure(text="☁ Upload Failed",
-                                                  text_color=DANGER)
+                        self.lbl_status.configure(
+                            text="☁ Upload Pending (no internet)",
+                            text_color=WARNING)
                         self.timeline_text.insert(
-                            tk.END, f"☁ Upload failed: {result}\n")
+                            tk.END,
+                            f"☁ Upload pending ({case_id}): {result}\n"
+                            "It will upload when internet returns — or "
+                            "press SYNC PENDING REPORTS.\n")
                         self.timeline_text.see(tk.END)
 
                 elif kind == "model_ready":
                     self.hw_label.configure(
                         text=f"HARDWARE: {self.device.upper()}",
                         text_color=ACCENT if self.device == "cuda" else WARNING)
-                    if not self.is_scanning and not self.auth.offline_mode:
+                    if not self.is_scanning:
                         self.lbl_status.configure(text="✅ System Ready",
                                                   text_color=SUCCESS)
 
