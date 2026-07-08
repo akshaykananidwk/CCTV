@@ -1,15 +1,15 @@
 @echo off
 REM ============================================================
-REM  i-Footege Intelligence - One-time installer (Windows)
+REM  Krishna Intelligence - One-time installer (Windows)
 REM  LCB Technical Cell, Devbhoomi Dwarka
 REM ------------------------------------------------------------
 REM  Needs: Python 3.10+ installed from https://www.python.org
 REM  (During Python setup, tick "Add Python to PATH")
 REM ============================================================
-title i-Footege Intelligence - Installer
+title Krishna Intelligence - Installer
 echo.
 echo  ==============================================
-echo   i-Footege Intelligence - Installation
+echo   Krishna Intelligence - Installation
 echo  ==============================================
 echo.
 

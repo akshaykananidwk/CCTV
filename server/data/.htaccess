@@ -1,0 +1,3 @@
+# Krishna Intelligence — protect the database and report files.
+# Reports are served ONLY through view.php with a secret token.
+Require all denied

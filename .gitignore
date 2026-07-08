@@ -2,3 +2,13 @@ __pycache__/
 *.pyc
 *.pt
 LCB_Forensic_Data/
+Krishna_Forensic_Data/
+*.log
+venv/
+build/
+dist/
+*.spec
+client_config.json
+server/data/*.db
+server/data/*.db-*
+server/data/reports/

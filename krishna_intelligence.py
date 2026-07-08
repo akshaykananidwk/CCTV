@@ -1,16 +1,23 @@
 """
-i-Footege Intelligence — Forensic CCTV Video Analysis Suite
+Krishna Intelligence — Forensic CCTV Video Analysis Suite
 LCB Technical Cell, Devbhoomi Dwarka
-Version 12.0 Pro Enterprise
+Version 13.0 Pro Enterprise
 
 Features:
+  - Secure login: the app authenticates against the Krishna web panel on
+    startup; sessions stay valid for 7 days, then login is required again
+  - Device audit: PC name / OS / Windows user is logged on the server for
+    every login (visible in the admin panel)
   - Batch CCTV video analysis with YOLOv8 detection + tracking (GPU/CPU auto)
   - Smart filters: object type (Person / Vehicle / Animal) and dominant color
   - Unique-ID evidence capture (one photo per tracked object, per video)
   - Image enhancement (fast CLAHE + sharpening) and Night Vision mode
   - Live evidence gallery, timeline log, and live statistics
   - Case management: per-case folders, JSON case report
-  - Export: CSV database + PDF photo report (reportlab)
+  - Export: CSV database + PDF photo report with the police-station header
+  - Auto-upload: the finished report (PDF + JSON, never the videos) is
+    uploaded to the web panel and a WhatsApp message with the view link is
+    sent to the operator's registered mobile number
   - Pause / Resume / Abort controls, responsive video display
 """
 
@@ -30,16 +37,23 @@ import json
 import csv
 import logging
 import traceback
-from datetime import datetime
+import platform
+import getpass
+import requests
+from datetime import datetime, timedelta
 from collections import defaultdict
 import warnings
 
 warnings.filterwarnings('ignore')
 
-APP_NAME = "i-Footege Intelligence"
-APP_VERSION = "v12.0 Pro Enterprise"
+APP_NAME = "Krishna Intelligence"
+APP_VERSION = "v13.0 Pro Enterprise"
 ORG_LINE_1 = "LCB Technical Cell"
 ORG_LINE_2 = "DEVBHOOMI DWARKA"
+
+CLIENT_CONFIG_FILE = "client_config.json"
+SESSION_DIR = os.path.join(os.path.expanduser("~"), ".krishna_intelligence")
+SESSION_FILE = os.path.join(SESSION_DIR, "session.json")
 
 # ---------------------------------------------------------------- appearance
 ctk.set_appearance_mode("dark")
@@ -60,7 +74,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("i_footege.log", encoding="utf-8"),
+        logging.FileHandler("krishna_intelligence.log", encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -78,6 +92,304 @@ def open_path(path):
             subprocess.Popen(["xdg-open", path])
     except Exception as exc:
         log.warning("Could not open %s: %s", path, exc)
+
+
+# ============================================================== auth client =
+class AuthClient:
+    """Talks to the Krishna web panel: login, session verify, report upload."""
+
+    def __init__(self):
+        self.server_url = ""
+        self.token = ""
+        self.expires_at = None          # datetime
+        self.profile = {}               # name, username, police_station, mobile
+        self.offline_mode = False
+        self._load_client_config()
+
+    # ------------------------------------------------------------- config --
+    def _load_client_config(self):
+        try:
+            with open(CLIENT_CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.server_url = cfg.get("server_url", "").rstrip("/")
+        except (OSError, ValueError):
+            self.server_url = ""
+
+    def save_client_config(self, server_url):
+        self.server_url = server_url.rstrip("/")
+        try:
+            with open(CLIENT_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump({"server_url": self.server_url}, f, indent=2)
+        except OSError as exc:
+            log.warning("Could not save client config: %s", exc)
+
+    # ------------------------------------------------------------ session --
+    def load_saved_session(self):
+        """Return True when a stored (unexpired) 7-day session exists."""
+        try:
+            with open(SESSION_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            expires = datetime.fromisoformat(data["expires_at"])
+            if datetime.now() >= expires:
+                return False
+            if data.get("server_url") and not self.server_url:
+                self.server_url = data["server_url"]
+            self.token = data["token"]
+            self.expires_at = expires
+            self.profile = data.get("profile", {})
+            return bool(self.token)
+        except (OSError, KeyError, ValueError):
+            return False
+
+    def _save_session(self):
+        try:
+            os.makedirs(SESSION_DIR, exist_ok=True)
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "token": self.token,
+                    "expires_at": self.expires_at.isoformat(timespec="seconds"),
+                    "profile": self.profile,
+                    "server_url": self.server_url,
+                }, f, indent=2)
+        except OSError as exc:
+            log.warning("Could not save session: %s", exc)
+
+    def clear_session(self):
+        self.token = ""
+        self.profile = {}
+        self.expires_at = None
+        try:
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------- device --
+    @staticmethod
+    def device_info():
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = "unknown"
+        return {
+            "device_name": platform.node() or "unknown",
+            "device_os": f"{platform.system()} {platform.release()}",
+            "device_user": user,
+        }
+
+    # ---------------------------------------------------------- API calls --
+    def _post(self, action, data=None, files=None, timeout=20):
+        url = f"{self.server_url}/api.php?action={action}"
+        resp = requests.post(url, data=data or {}, files=files, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def login(self, username, password):
+        """Returns (ok, message)."""
+        if not self.server_url:
+            return False, "Server URL is not set."
+        payload = {"username": username, "password": password}
+        payload.update(self.device_info())
+        try:
+            out = self._post("login", payload)
+        except requests.RequestException as exc:
+            log.error("Login request failed: %s", exc)
+            return False, "Cannot reach the server. Check internet / server URL."
+        except ValueError:
+            return False, "Invalid response from server."
+        if not out.get("ok"):
+            return False, out.get("error", "Login failed.")
+        self.token = out["token"]
+        self.expires_at = datetime.now() + timedelta(days=int(out.get("valid_days", 7)))
+        self.profile = out.get("profile", {})
+        self.offline_mode = False
+        self._save_session()
+        return True, "Login successful."
+
+    def verify(self):
+        """Validate the saved token. Returns 'ok', 'invalid' or 'offline'."""
+        if not self.token or not self.server_url:
+            return "invalid"
+        try:
+            out = self._post("verify", {"token": self.token,
+                                        **self.device_info()}, timeout=12)
+        except requests.RequestException:
+            return "offline"
+        except ValueError:
+            return "invalid"
+        if out.get("ok"):
+            self.profile = out.get("profile", self.profile)
+            self._save_session()
+            return "ok"
+        return "invalid"
+
+    def upload_report(self, case_id, pdf_path, json_path, stats):
+        """Upload the case report (PDF + JSON only). Returns (ok, link_or_error)."""
+        if not self.token:
+            return False, "Not logged in."
+        try:
+            files = {}
+            handles = []
+            for field, path in (("report_pdf", pdf_path),
+                                ("report_json", json_path)):
+                if path and os.path.exists(path):
+                    fh = open(path, "rb")
+                    handles.append(fh)
+                    files[field] = (os.path.basename(path), fh)
+            if not files:
+                return False, "No report files to upload."
+            try:
+                out = self._post("upload_report", {
+                    "token": self.token,
+                    "case_id": case_id,
+                    "persons": stats.get("persons", 0),
+                    "vehicles": stats.get("vehicles", 0),
+                    "total": stats.get("total", 0),
+                }, files=files, timeout=120)
+            finally:
+                for fh in handles:
+                    fh.close()
+        except requests.RequestException as exc:
+            log.error("Report upload failed: %s", exc)
+            return False, "Upload failed — server not reachable."
+        except ValueError:
+            return False, "Invalid response from server."
+        if out.get("ok"):
+            return True, out.get("view_url", "")
+        return False, out.get("error", "Upload rejected by server.")
+
+
+# ============================================================= login window =
+class LoginWindow(ctk.CTkToplevel):
+    """Blocking login gate shown before the main application starts."""
+
+    def __init__(self, parent, auth, on_success):
+        super().__init__(parent)
+        self.parent = parent
+        self.auth = auth
+        self.on_success = on_success
+        self._busy = False
+
+        self.title(f"{APP_NAME} — Login")
+        self.geometry("460x560")
+        self.configure(fg_color=BG_DARK)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._quit_app)
+
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 230
+        y = (self.winfo_screenheight() // 2) - 280
+        self.geometry(f"+{x}+{y}")
+
+        self._build_ui()
+        # Try the saved 7-day session first.
+        self.after(200, self._try_saved_session)
+
+    def _build_ui(self):
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(expand=True, fill="both", padx=30, pady=20)
+
+        ctk.CTkLabel(frame, text="🦚", font=("Arial", 52)).pack(pady=(10, 0))
+        ctk.CTkLabel(frame, text=APP_NAME, font=("Arial Black", 24, "bold"),
+                     text_color=HIGHLIGHT).pack()
+        ctk.CTkLabel(frame, text=f"{ORG_LINE_1} | {ORG_LINE_2}",
+                     font=("Courier", 11, "bold"),
+                     text_color=ACCENT).pack(pady=(0, 15))
+
+        self.server_entry = ctk.CTkEntry(frame, height=38,
+                                         placeholder_text="Server URL (https://...)")
+        self.server_entry.pack(fill="x", pady=5)
+        if self.auth.server_url:
+            self.server_entry.insert(0, self.auth.server_url)
+
+        self.user_entry = ctk.CTkEntry(frame, height=38,
+                                       placeholder_text="Username")
+        self.user_entry.pack(fill="x", pady=5)
+        self.pass_entry = ctk.CTkEntry(frame, height=38, show="•",
+                                       placeholder_text="Password")
+        self.pass_entry.pack(fill="x", pady=5)
+        self.pass_entry.bind("<Return>", lambda e: self._do_login())
+
+        self.btn_login = ctk.CTkButton(frame, text="🔐 LOGIN", height=44,
+                                       font=("Arial", 13, "bold"),
+                                       fg_color=SUCCESS, hover_color="#059669",
+                                       command=self._do_login)
+        self.btn_login.pack(fill="x", pady=(15, 5))
+
+        self.lbl_msg = ctk.CTkLabel(frame, text="", font=("Arial", 11),
+                                    wraplength=380, text_color="gray")
+        self.lbl_msg.pack(pady=8)
+
+        ctk.CTkLabel(frame,
+                     text="New user? Register on the web panel —\n"
+                          "your login details arrive on WhatsApp.",
+                     font=("Arial", 10), text_color="gray").pack(pady=(5, 0))
+        ctk.CTkLabel(frame, text=APP_VERSION, font=("Courier", 9),
+                     text_color="gray").pack(side="bottom", pady=5)
+
+    def _quit_app(self):
+        self.parent.destroy()
+
+    def _set_msg(self, text, color="gray"):
+        self.lbl_msg.configure(text=text, text_color=color)
+
+    def _try_saved_session(self):
+        if not self.auth.load_saved_session():
+            self._set_msg("Please login to continue.", "gray")
+            return
+        self._set_msg("Verifying saved login...", ACCENT)
+        self._busy = True
+
+        def worker():
+            status = self.auth.verify()
+            self.after(0, lambda: self._saved_session_result(status))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _saved_session_result(self, status):
+        self._busy = False
+        if status == "ok":
+            self._finish(offline=False)
+        elif status == "offline":
+            # Server unreachable but the local session is still inside its
+            # 7-day window: allow work, disable uploads.
+            self.auth.offline_mode = True
+            self._finish(offline=True)
+        else:
+            self.auth.clear_session()
+            self._set_msg("Session expired — please login again.", WARNING)
+
+    def _do_login(self):
+        if self._busy:
+            return
+        server = self.server_entry.get().strip()
+        username = self.user_entry.get().strip()
+        password = self.pass_entry.get()
+        if not server or not username or not password:
+            self._set_msg("Enter server URL, username and password.", DANGER)
+            return
+        self.auth.save_client_config(server)
+        self._busy = True
+        self.btn_login.configure(state="disabled", text="Logging in...")
+        self._set_msg("Contacting server...", ACCENT)
+
+        def worker():
+            ok, message = self.auth.login(username, password)
+            self.after(0, lambda: self._login_result(ok, message))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _login_result(self, ok, message):
+        self._busy = False
+        self.btn_login.configure(state="normal", text="🔐 LOGIN")
+        if ok:
+            self._finish(offline=False)
+        else:
+            self._set_msg(message, DANGER)
+
+    def _finish(self, offline):
+        self.destroy()
+        self.on_success(offline)
 
 
 # ================================================================== splash ==
@@ -102,7 +414,6 @@ class SplashScreen(ctk.CTkToplevel):
         self.setup_ui()
         self.animate()
 
-        # Keep the splash up at least 3 seconds, then wait for the model.
         self.after(3000, self._mark_min_time)
         self.after(300, self._poll_ready)
 
@@ -113,7 +424,7 @@ class SplashScreen(ctk.CTkToplevel):
         self.canvas = tk.Canvas(main_frame, width=400, height=150,
                                 bg=BG_DARK, highlightthickness=0)
         self.canvas.pack(pady=10)
-        self.canvas.create_text(200, 75, text="🔍", font=("Arial", 60),
+        self.canvas.create_text(200, 75, text="🦚", font=("Arial", 60),
                                 fill=HIGHLIGHT, anchor="center", tags="logo")
 
         ctk.CTkLabel(main_frame, text=APP_NAME,
@@ -147,7 +458,7 @@ class SplashScreen(ctk.CTkToplevel):
             self.lbl_loading.configure(text=texts[(i // 25) % len(texts)])
             self.canvas.delete("logo")
             self.canvas.create_text(200, 75,
-                                    text="🔍" if i % 20 < 10 else "⚡",
+                                    text="🦚" if i % 20 < 10 else "⚡",
                                     font=("Arial", 60), fill=HIGHLIGHT,
                                     anchor="center", tags="logo")
             self.after(60, tick, i + 1)
@@ -158,7 +469,6 @@ class SplashScreen(ctk.CTkToplevel):
         self._min_time_done = True
 
     def _poll_ready(self):
-        """Close once the model finished loading (or failed) and 3s passed."""
         if self._min_time_done and self.parent.model_status != "loading":
             self.close_splash()
         else:
@@ -174,7 +484,7 @@ class SplashScreen(ctk.CTkToplevel):
 
 
 # ==================================================================== app ===
-class ForensicVideoIntelligence(ctk.CTk):
+class KrishnaIntelligence(ctk.CTk):
     # COCO class-id -> display name
     CATEGORIES = {0: "Person", 2: "Car", 3: "Motorcycle", 5: "Bus",
                   7: "Truck", 15: "Cat", 16: "Dog", 19: "Cow"}
@@ -185,7 +495,7 @@ class ForensicVideoIntelligence(ctk.CTk):
         super().__init__()
         self.withdraw()
 
-        self.title(f"🔍 {APP_NAME} | {ORG_LINE_1.upper()} {ORG_LINE_2}")
+        self.title(f"🦚 {APP_NAME} | {ORG_LINE_1.upper()} {ORG_LINE_2}")
         self.geometry("1400x800")
         self._maximize_window()
         self.configure(fg_color=BG_DARK)
@@ -193,7 +503,7 @@ class ForensicVideoIntelligence(ctk.CTk):
         # ---------------- engine state ----------------
         self.video_list = []
         self.current_video_idx = 0
-        self.base_dir = "LCB_Forensic_Data"
+        self.base_dir = "Krishna_Forensic_Data"
         self.current_case_dir = ""
         self.current_case_id = ""
         self.is_scanning = False
@@ -218,12 +528,42 @@ class ForensicVideoIntelligence(ctk.CTk):
         self.model_error = ""
         self.device = "cpu"
 
+        # ---------------- auth ----------------
+        self.auth = AuthClient()
+
         self.setup_directories()
         self.setup_ui()
+        self.process_queue()
+
+        # Login gate first; splash + model load start after login succeeds.
+        self.login_window = LoginWindow(self, self.auth, self._on_logged_in)
+
+    # ---------------------------------------------------------- login flow -
+    def _on_logged_in(self, offline):
+        profile = self.auth.profile or {}
+        station = profile.get("police_station", "")
+        operator = profile.get("name", profile.get("username", ""))
+        if station:
+            self.station_label.configure(text=f"🏢 {station}")
+        if operator:
+            self.operator_label.configure(text=f"👮 {operator}")
+        if offline:
+            self.lbl_status.configure(text="⚠ OFFLINE MODE (no upload)",
+                                      text_color=WARNING)
+        log.info("Logged in as %s (%s) offline=%s",
+                 profile.get("username"), station, offline)
 
         self.splash = SplashScreen(self)
         threading.Thread(target=self._load_model, daemon=True).start()
-        self.process_queue()
+
+    def logout(self):
+        if self.is_scanning:
+            messagebox.showwarning("Busy", "Stop the scan before logging out.")
+            return
+        if not messagebox.askyesno("Logout", "Logout and close the software?"):
+            return
+        self.auth.clear_session()
+        self.destroy()
 
     # ------------------------------------------------------------- window --
     def _maximize_window(self):
@@ -267,9 +607,9 @@ class ForensicVideoIntelligence(ctk.CTk):
 
     def on_splash_closed(self):
         if self.model_status == "ready":
-            self.lbl_status.configure(text="✅ System Ready", text_color=SUCCESS)
-            self.after(3000, lambda: self.lbl_status.configure(
-                text="System Standby", text_color="gray"))
+            if not self.auth.offline_mode:
+                self.lbl_status.configure(text="✅ System Ready",
+                                          text_color=SUCCESS)
         elif self.model_status == "failed":
             self.lbl_status.configure(text="❌ AI Model Failed", text_color=DANGER)
             messagebox.showerror(
@@ -277,7 +617,7 @@ class ForensicVideoIntelligence(ctk.CTk):
                 "The YOLOv8 model could not be loaded.\n\n"
                 f"Reason: {self.model_error}\n\n"
                 "First run needs internet access to download 'yolov8s.pt'.\n"
-                "Check i_footege.log for details, then restart the app.")
+                "Check krishna_intelligence.log for details, then restart.")
 
     # --------------------------------------------------------------- dirs --
     def setup_directories(self):
@@ -295,12 +635,26 @@ class ForensicVideoIntelligence(ctk.CTk):
         self.sidebar.grid(row=0, column=0, sticky="nsew")
 
         header = ctk.CTkFrame(self.sidebar, fg_color=HIGHLIGHT, corner_radius=8)
-        header.pack(fill="x", pady=(10, 20), padx=10)
-        ctk.CTkLabel(header, text="🔍 i-Footege", font=("Arial Black", 24),
+        header.pack(fill="x", pady=(10, 10), padx=10)
+        ctk.CTkLabel(header, text="🦚 Krishna", font=("Arial Black", 24),
                      text_color=BG_DARK).pack(pady=(15, 0))
+        ctk.CTkLabel(header, text="INTELLIGENCE", font=("Arial Black", 14),
+                     text_color=BG_DARK).pack()
         ctk.CTkLabel(header, text=ORG_LINE_1.upper(),
                      font=("Courier", 10, "bold"),
                      text_color=BG_DARK).pack(pady=(0, 15))
+
+        # ---- operator / police-station strip ----
+        who = ctk.CTkFrame(self.sidebar, fg_color=BG_DARK, corner_radius=8)
+        who.pack(fill="x", padx=10, pady=(0, 10))
+        self.station_label = ctk.CTkLabel(who, text="🏢 —",
+                                          font=("Arial", 11, "bold"),
+                                          text_color=GOLD)
+        self.station_label.pack(pady=(8, 0))
+        self.operator_label = ctk.CTkLabel(who, text="👮 —",
+                                           font=("Arial", 10),
+                                           text_color=ACCENT)
+        self.operator_label.pack(pady=(0, 8))
 
         # ---- batch control ----
         actions = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -381,7 +735,14 @@ class ForensicVideoIntelligence(ctk.CTk):
         self.night_switch = ctk.CTkSwitch(settings, text="🌙 Night Vision Mode",
                                           font=("Arial", 11),
                                           progress_color=PURPLE)
-        self.night_switch.pack(pady=(5, 10), padx=15, anchor="w")
+        self.night_switch.pack(pady=(5, 5), padx=15, anchor="w")
+
+        self.upload_switch = ctk.CTkSwitch(settings,
+                                           text="☁ Auto-Upload Report",
+                                           font=("Arial", 11),
+                                           progress_color=ACCENT)
+        self.upload_switch.pack(pady=(5, 10), padx=15, anchor="w")
+        self.upload_switch.select()
 
         # ---- export ----
         exp = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -397,9 +758,13 @@ class ForensicVideoIntelligence(ctk.CTk):
         ctk.CTkButton(self.sidebar, text="📁 OPEN DATABASE",
                       font=("Arial", 11, "bold"), fg_color="#34495E",
                       hover_color=ACCENT, height=40,
-                      command=self.open_folder).pack(pady=(5, 15), padx=10, fill="x")
+                      command=self.open_folder).pack(pady=5, padx=10, fill="x")
+        ctk.CTkButton(self.sidebar, text="🚪 LOGOUT",
+                      font=("Arial", 11, "bold"), fg_color="#7F1D1D",
+                      hover_color=DANGER, height=36,
+                      command=self.logout).pack(pady=(5, 15), padx=10, fill="x")
 
-        self.lbl_status = ctk.CTkLabel(self.sidebar, text="Loading AI Model...",
+        self.lbl_status = ctk.CTkLabel(self.sidebar, text="Please login...",
                                        font=("Courier", 10), text_color="gray")
         self.lbl_status.pack(side="bottom", pady=10)
 
@@ -531,7 +896,6 @@ class ForensicVideoIntelligence(ctk.CTk):
 
         case_id = self.case_entry.get().strip() or \
             f"CASE_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        # Keep the case id filesystem-safe.
         case_id = "".join(c if c.isalnum() or c in "-_ " else "_" for c in case_id)
         self.current_case_id = case_id
         self.current_case_dir = os.path.join(self.base_dir, "Cases", case_id)
@@ -544,6 +908,7 @@ class ForensicVideoIntelligence(ctk.CTk):
             "color_filter": self.color_filter.get(),
             "night_mode": bool(self.night_switch.get()),
             "enhance": bool(self.enhance_switch.get()),
+            "auto_upload": bool(self.upload_switch.get()),
             "conf": self.conf_threshold,
         }
 
@@ -746,7 +1111,6 @@ class ForensicVideoIntelligence(ctk.CTk):
         """Dominant-color estimate from the center region of the crop."""
         try:
             h, w = crop.shape[:2]
-            # Center region only — edges are mostly background.
             region = crop[h // 5: h - h // 5, w // 5: w - w // 5]
             if region.size == 0:
                 region = crop
@@ -821,9 +1185,12 @@ class ForensicVideoIntelligence(ctk.CTk):
         if not self.current_case_dir:
             return
 
+        profile = self.auth.profile or {}
         report = {
             "app": f"{APP_NAME} {APP_VERSION}",
             "case_id": self.current_case_id,
+            "police_station": profile.get("police_station", ""),
+            "operator": profile.get("name", profile.get("username", "")),
             "generated": datetime.now().isoformat(timespec="seconds"),
             "started": self.scan_started_at.isoformat(timespec="seconds")
             if self.scan_started_at else None,
@@ -834,12 +1201,19 @@ class ForensicVideoIntelligence(ctk.CTk):
                       "total_evidence": len(self.evidence_database)},
             "evidence": self.evidence_database,
         }
+        json_path = os.path.join(self.current_case_dir, "report.json")
         try:
-            with open(os.path.join(self.current_case_dir, "report.json"),
-                      "w", encoding="utf-8") as f:
+            with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
         except OSError as exc:
             log.error("Could not write report.json: %s", exc)
+
+        # Auto-generate the PDF report inside the case folder.
+        pdf_path = os.path.join(self.current_case_dir, "report.pdf")
+        pdf_ok, pdf_err = self._build_pdf(pdf_path)
+        if not pdf_ok:
+            log.warning("Auto PDF failed: %s", pdf_err)
+            pdf_path = ""
 
         if aborted:
             self.lbl_status.configure(text="⏹ Analysis Aborted",
@@ -862,64 +1236,77 @@ class ForensicVideoIntelligence(ctk.CTk):
         log.info("Scan finished | aborted=%s evidence=%d",
                  aborted, len(self.evidence_database))
 
-    # ------------------------------------------------------------- exports -
-    def export_csv(self):
-        if not self.evidence_database:
-            messagebox.showwarning("No Data", "No evidence to export!")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV File", "*.csv")],
-            initialfile=f"{self.current_case_id or 'case'}_evidence.csv")
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=list(self.evidence_database[0].keys()))
-                writer.writeheader()
-                writer.writerows(self.evidence_database)
-            messagebox.showinfo("Exported", "CSV Database Exported Successfully!")
-        except OSError as exc:
-            messagebox.showerror("Export Failed", f"Could not write CSV:\n{exc}")
+        # Auto-upload ONLY the report (PDF + JSON) — never the videos.
+        if (not aborted and self.scan_config.get("auto_upload")
+                and self.evidence_database):
+            self._start_report_upload(json_path, pdf_path)
 
-    def export_pdf(self):
-        if not self.evidence_database:
-            messagebox.showwarning("No Data", "No evidence to export!")
+    # ------------------------------------------------------------- upload --
+    def _start_report_upload(self, json_path, pdf_path):
+        if self.auth.offline_mode or not self.auth.token:
+            self.gui_queue.put(("timeline",
+                                "☁ Offline mode — report NOT uploaded.\n"))
             return
+        self.lbl_status.configure(text="☁ Uploading report...",
+                                  text_color=ACCENT)
+        case_id = self.current_case_id
+        stats = {"persons": self.stats.get("persons", 0),
+                 "vehicles": self.stats.get("vehicles", 0),
+                 "total": len(self.evidence_database)}
+
+        def worker():
+            ok, result = self.auth.upload_report(case_id, pdf_path,
+                                                 json_path, stats)
+            self.gui_queue.put(("upload_result", ok, result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------------------------------------------------------- PDF build --
+    def _build_pdf(self, path):
+        """Write the case PDF report to `path`. Returns (ok, error)."""
+        if not self.evidence_database:
+            return False, "No evidence."
         try:
             from reportlab.lib.pagesizes import A4
             from reportlab.lib.units import cm
             from reportlab.lib import colors as rl_colors
+            from reportlab.lib.enums import TA_CENTER
             from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
             from reportlab.platypus import (SimpleDocTemplate, Paragraph,
                                             Spacer, Table, TableStyle,
                                             Image as RLImage)
         except ImportError:
-            messagebox.showerror(
-                "Missing Package",
-                "PDF export needs the 'reportlab' package.\n\n"
-                "Install it with:  pip install reportlab")
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".pdf", filetypes=[("PDF File", "*.pdf")],
-            initialfile=f"{self.current_case_id or 'case'}_report.pdf")
-        if not path:
-            return
+            return False, "reportlab is not installed (pip install reportlab)."
 
         try:
+            profile = self.auth.profile or {}
+            station = profile.get("police_station", "")
+            operator = profile.get("name", profile.get("username", ""))
+
             styles = getSampleStyleSheet()
-            title_style = ParagraphStyle("TitleX", parent=styles["Title"],
-                                         textColor=rl_colors.HexColor("#111827"))
+            station_style = ParagraphStyle(
+                "Station", parent=styles["Title"], fontSize=16,
+                alignment=TA_CENTER,
+                textColor=rl_colors.HexColor("#7F1D1D"))
+            title_style = ParagraphStyle(
+                "TitleX", parent=styles["Title"], fontSize=14,
+                alignment=TA_CENTER,
+                textColor=rl_colors.HexColor("#111827"))
             small = ParagraphStyle("Small", parent=styles["Normal"], fontSize=9)
 
             doc = SimpleDocTemplate(path, pagesize=A4,
                                     topMargin=1.5 * cm, bottomMargin=1.5 * cm)
-            story = [
+            story = []
+            # Police-station name always on top of the PDF.
+            if station:
+                story.append(Paragraph(station.upper(), station_style))
+                story.append(Spacer(1, 4))
+            story += [
                 Paragraph(f"{APP_NAME} — Forensic Evidence Report", title_style),
-                Paragraph(f"{ORG_LINE_1}, {ORG_LINE_2}", styles["Heading3"]),
+                Paragraph(f"{ORG_LINE_1}, {ORG_LINE_2}", styles["Heading4"]),
                 Spacer(1, 8),
                 Paragraph(f"<b>Case ID:</b> {self.current_case_id or '-'}", small),
+                Paragraph(f"<b>Operator:</b> {operator or '-'}", small),
                 Paragraph(f"<b>Generated:</b> "
                           f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}", small),
                 Paragraph(f"<b>Videos analysed:</b> {len(self.video_list)}", small),
@@ -963,11 +1350,46 @@ class ForensicVideoIntelligence(ctk.CTk):
             ]))
             story.append(table)
             doc.build(story)
+            return True, ""
+        except Exception as exc:
+            log.error("PDF build failed: %s\n%s", exc, traceback.format_exc())
+            return False, str(exc)
+
+    # ------------------------------------------------------------- exports -
+    def export_csv(self):
+        if not self.evidence_database:
+            messagebox.showwarning("No Data", "No evidence to export!")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV File", "*.csv")],
+            initialfile=f"{self.current_case_id or 'case'}_evidence.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=list(self.evidence_database[0].keys()))
+                writer.writeheader()
+                writer.writerows(self.evidence_database)
+            messagebox.showinfo("Exported", "CSV Database Exported Successfully!")
+        except OSError as exc:
+            messagebox.showerror("Export Failed", f"Could not write CSV:\n{exc}")
+
+    def export_pdf(self):
+        if not self.evidence_database:
+            messagebox.showwarning("No Data", "No evidence to export!")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf", filetypes=[("PDF File", "*.pdf")],
+            initialfile=f"{self.current_case_id or 'case'}_report.pdf")
+        if not path:
+            return
+        ok, err = self._build_pdf(path)
+        if ok:
             messagebox.showinfo("Exported", "PDF Report Exported Successfully!")
             open_path(path)
-        except Exception as exc:
-            log.error("PDF export failed: %s\n%s", exc, traceback.format_exc())
-            messagebox.showerror("Export Failed", f"Could not create PDF:\n{exc}")
+        else:
+            messagebox.showerror("Export Failed", f"Could not create PDF:\n{err}")
 
     # --------------------------------------------------------------- misc --
     def open_folder(self):
@@ -1040,11 +1462,33 @@ class ForensicVideoIntelligence(ctk.CTk):
                         self.current_video_idx += 1
                         self.process_next_video()
 
+                elif kind == "upload_result":
+                    ok, result = msg[1], msg[2]
+                    if ok:
+                        self.lbl_status.configure(text="☁ Report Uploaded ✅",
+                                                  text_color=SUCCESS)
+                        self.timeline_text.insert(
+                            tk.END, f"☁ Report uploaded: {result}\n"
+                                    "📲 WhatsApp message sent.\n")
+                        self.timeline_text.see(tk.END)
+                        messagebox.showinfo(
+                            "Uploaded",
+                            "Report uploaded to the web panel!\n"
+                            "📲 A WhatsApp message with the report link "
+                            "was sent to your registered number.\n\n"
+                            f"🔗 {result}")
+                    else:
+                        self.lbl_status.configure(text="☁ Upload Failed",
+                                                  text_color=DANGER)
+                        self.timeline_text.insert(
+                            tk.END, f"☁ Upload failed: {result}\n")
+                        self.timeline_text.see(tk.END)
+
                 elif kind == "model_ready":
                     self.hw_label.configure(
                         text=f"HARDWARE: {self.device.upper()}",
                         text_color=ACCENT if self.device == "cuda" else WARNING)
-                    if not self.is_scanning:
+                    if not self.is_scanning and not self.auth.offline_mode:
                         self.lbl_status.configure(text="✅ System Ready",
                                                   text_color=SUCCESS)
 
@@ -1059,5 +1503,5 @@ class ForensicVideoIntelligence(ctk.CTk):
 
 
 if __name__ == "__main__":
-    app = ForensicVideoIntelligence()
+    app = KrishnaIntelligence()
     app.mainloop()
