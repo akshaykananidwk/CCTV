@@ -1,29 +1,41 @@
 """
 Krishna Intelligence — Forensic CCTV Video Analysis Suite
-Version 14.0 Pro Enterprise
+Version 16.0 Pro Enterprise
 
-Features:
-  - Secure login: the app authenticates against the Krishna web panel on
-    startup; sessions stay valid for 7 days, then login is required again
-  - Device audit: PC name / OS / Windows user is logged on the server for
-    every login (visible in the admin panel)
-  - Batch CCTV video analysis with YOLOv8 detection + tracking (GPU/CPU auto)
-  - Smart filters: object type (Person / Vehicle / Animal) and dominant color
-  - Unique-ID evidence capture (one photo per tracked object, per video)
-  - Image enhancement (fast CLAHE + sharpening) and Night Vision mode
-  - Live evidence gallery, timeline log, and live statistics
-  - Case management: per-case evidence folders on the PC
-  - Reports live ONLY on the web panel: after every scan (even aborted)
-    the report (PDF + JSON, never the videos) is uploaded automatically —
-    no local report copies are kept — and a WhatsApp message with the view
-    link goes to the operator's registered mobile number; failed uploads
-    stay queued and are re-sent when internet returns
-  - Forgot Password from the login screen (WhatsApp OTP)
-  - Pause / Resume / Abort controls, responsive video display
+Core:
+  - Secure login (7-day sessions, internet mandatory, Forgot Password via
+    WhatsApp OTP, device/PC audit trail on the server)
+  - Batch CCTV video analysis with YOLOv8 detection + tracking (GPU/CPU auto,
+    selectable model size, multi-GPU aware, auto hardware benchmark)
+  - Smart filters (object type / color), unique-ID evidence capture,
+    enhancement + Night Vision, pause/resume/abort, resume an interrupted
+    scan after a crash or power cut
+  - Reports live ONLY on the web panel (PDF + JSON, never videos); queued
+    locally and retried automatically when internet is unavailable
+
+Investigation aids (v16):
+  - Clothing color split (upper/lower), movement direction + approximate
+    relative speed, loitering and crowd alerts, cross-video "possible same
+    suspect" heuristic matches
+  - Optional: face recognition against a local Known_Suspects folder, face
+    blurring, number-plate OCR, CCTV overlay-timestamp OCR (each needs an
+    extra package — the app tells you which, and disables the switch if
+    missing rather than failing)
+  - Evidence tools: manual evidence add, star/note/delete, in-app zoom
+    viewer, search, ZIP export, ±5s clip export from the source video
+  - Case tools: status/notes, templates, recent-cases review, two-case
+    heuristic comparison
+  - Security: optional at-rest encryption of saved evidence images, PDF
+    verification code + operator/designation stamp, evidence photo
+    watermark, auto-lock on inactivity, SHA-256 hash of every source video
+  - Analytics dashboard, printer output (temp file only, never persisted)
+
+See README.md for exactly which of these need an extra `pip install` or a
+one-time setup step, and which advanced items are intentionally deferred.
 """
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import customtkinter as ctk
 from PIL import Image
 import cv2
@@ -42,18 +54,54 @@ import platform
 import getpass
 import webbrowser
 import requests
+import hashlib
+import io
+import math
+import re
+import zipfile
+import tempfile
 from datetime import datetime, timedelta
 from collections import defaultdict
 import warnings
 
 warnings.filterwarnings('ignore')
 
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except BaseException:  # noqa: broad on purpose — a broken/mismatched
+    # optional install (including native-extension panics that are not
+    # plain ImportError/Exception, e.g. pyo3_runtime.PanicException) must
+    # never stop the whole app from starting.
+    HAS_TESSERACT = False
+
+try:
+    from cryptography.fernet import Fernet
+    HAS_CRYPTO = True
+except BaseException:  # noqa: broad — see reasoning above
+    HAS_CRYPTO = False
+
 APP_NAME = "Krishna Intelligence"
-APP_VERSION = "v14.0 Pro Enterprise"
+APP_VERSION = "v16.0 Pro Enterprise"
 
 CLIENT_CONFIG_FILE = "client_config.json"
+SETTINGS_FILE = "app_settings.json"
+RESUME_FILE = "resume_state.json"
+RECENT_CASES_FILE = "recent_cases.json"
+GUJARATI_FONT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fonts",
+    "NotoSansGujarati-Regular.ttf")
 SESSION_DIR = os.path.join(os.path.expanduser("~"), ".krishna_intelligence")
 SESSION_FILE = os.path.join(SESSION_DIR, "session.json")
+
+DEFAULT_SETTINGS = {
+    "theme": "dark",
+    "model_size": "yolov8s.pt",
+    "gpu_index": 0,
+    "autolock_minutes": 0,
+    "loiter_seconds": 30,
+    "crowd_alert": 8,
+}
 
 # ---------------------------------------------------------------- appearance
 ctk.set_appearance_mode("dark")
@@ -92,6 +140,53 @@ def open_path(path):
             subprocess.Popen(["xdg-open", path])
     except Exception as exc:
         log.warning("Could not open %s: %s", path, exc)
+
+
+def load_settings():
+    """Local (per-PC) app preferences — separate from the server profile."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data)
+        return merged
+    except (OSError, ValueError):
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except OSError as exc:
+        log.warning("Could not save settings: %s", exc)
+
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    """SHA-256 of a file, for evidentiary integrity of source videos."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            data = f.read(chunk_size)
+            if not data:
+                break
+            h.update(data)
+    return h.hexdigest()
+
+
+def get_or_create_encryption_key():
+    """Local Fernet key used only to protect evidence files at rest on
+    this PC. Not synced anywhere — losing it makes old encrypted evidence
+    unreadable, so it lives next to the session data."""
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    key_path = os.path.join(SESSION_DIR, "evidence.key")
+    if os.path.exists(key_path):
+        with open(key_path, "rb") as f:
+            return f.read()
+    key = Fernet.generate_key()
+    with open(key_path, "wb") as f:
+        f.write(key)
+    return key
 
 
 # ============================================================== auth client =
@@ -387,6 +482,44 @@ class ForgotPasswordDialog(ctk.CTkToplevel):
             self.lbl_msg.configure(text=msgtext, text_color=DANGER)
 
 
+# ======================================================= case compare UI ===
+class CaseCompareDialog(ctk.CTkToplevel):
+    """Pick two saved cases to run a heuristic cross-case comparison."""
+
+    def __init__(self, parent, cases, on_compare):
+        super().__init__(parent)
+        self.on_compare = on_compare
+        self.title("Compare Cases")
+        self.configure(fg_color=BG_DARK)
+        self.geometry("360x240")
+        self.resizable(False, False)
+        self.grab_set()
+
+        ctk.CTkLabel(self, text="🆚 Compare Two Cases",
+                     font=("Arial Black", 15),
+                     text_color=HIGHLIGHT).pack(pady=(18, 10))
+        ctk.CTkLabel(self, text="Case A", font=("Arial", 10),
+                     text_color="gray").pack()
+        self.combo_a = ctk.CTkComboBox(self, values=cases, width=280)
+        self.combo_a.pack(padx=20, pady=(0, 10))
+        ctk.CTkLabel(self, text="Case B", font=("Arial", 10),
+                     text_color="gray").pack()
+        self.combo_b = ctk.CTkComboBox(self, values=cases, width=280)
+        self.combo_b.pack(padx=20, pady=(0, 5))
+        ctk.CTkButton(self, text="Compare", fg_color=SUCCESS,
+                      hover_color="#059669",
+                      command=self._go).pack(pady=15, padx=20, fill="x")
+
+    def _go(self):
+        a, b = self.combo_a.get(), self.combo_b.get()
+        if not a or not b or a == b:
+            messagebox.showwarning("Pick Two", "Select two different cases.",
+                                   parent=self)
+            return
+        self.destroy()
+        self.on_compare(a, b)
+
+
 # ============================================================= login window =
 class LoginWindow(ctk.CTkToplevel):
     """Blocking login gate shown before the main application starts."""
@@ -641,6 +774,14 @@ class KrishnaIntelligence(ctk.CTk):
                   7: "Truck", 15: "Cat", 16: "Dog", 19: "Cow"}
     VEHICLES = ("Car", "Motorcycle", "Bus", "Truck")
     ANIMALS = ("Cat", "Dog", "Cow")
+    CASE_TEMPLATES = {
+        "Custom": None,
+        "Theft / Robbery": {"object": "All Objects", "color": "All Colors"},
+        "Vehicle Related": {"object": "Vehicle", "color": "All Colors"},
+        "Missing Person": {"object": "Person", "color": "All Colors"},
+        "Accident": {"object": "Vehicle", "color": "All Colors"},
+        "Crowd / Riot": {"object": "Person", "color": "All Colors"},
+    }
 
     def __init__(self):
         super().__init__()
@@ -671,6 +812,14 @@ class KrishnaIntelligence(ctk.CTk):
         self.stats = defaultdict(int)
         self.scan_started_at = None
 
+        # ---------------- tracking / analytics state ----------------
+        self.track_positions = {}                 # (video, id) -> [(f,cx,cy)]
+        self.track_first_seen = {}                 # (video, id) -> frame_idx
+        self.track_flagged_loiter = set()
+        self.evidence_by_track = {}                # (video, id) -> entry dict
+        self.video_hashes = {}
+        self._current_video_path = ""
+
         # ---------------- AI config ----------------
         self.conf_threshold = 0.35
         self.frame_skip = 5
@@ -678,6 +827,23 @@ class KrishnaIntelligence(ctk.CTk):
         self.model_status = "loading"             # loading | ready | failed
         self.model_error = ""
         self.device = "cpu"
+        self.gpu_count = 0
+
+        # ---------------- face recognition (optional) ----------------
+        self.face_cascade = None
+        try:
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            cascade = cv2.CascadeClassifier(cascade_path)
+            if not cascade.empty():
+                self.face_cascade = cascade
+        except Exception as exc:
+            log.warning("Face cascade unavailable: %s", exc)
+        self.face_recognizer = None
+        self.face_labels = {}
+        self._fernet_obj = None
+
+        # ---------------- local preferences ----------------
+        self.settings = load_settings()
 
         # ---------------- auth ----------------
         self.auth = AuthClient()
@@ -686,8 +852,72 @@ class KrishnaIntelligence(ctk.CTk):
         self.setup_ui()
         self.process_queue()
 
+        for seq in ("<Motion>", "<KeyPress>", "<Button>"):
+            self.bind_all(seq, self._register_activity, add="+")
+
         # Login gate first; splash + model load start after login succeeds.
         self.login_window = LoginWindow(self, self.auth, self._on_logged_in)
+
+    # ------------------------------------------------------- auto-lock -----
+    def _register_activity(self, event=None):
+        self._last_activity = time.time()
+
+    def _check_autolock(self):
+        minutes = self.settings.get("autolock_minutes", 0)
+        if (minutes and not self.is_scanning and not getattr(self, "_locked", False)
+                and time.time() - getattr(self, "_last_activity", time.time())
+                > minutes * 60):
+            self._show_lock_screen()
+        self.after(30000, self._check_autolock)
+
+    def _show_lock_screen(self):
+        self._locked = True
+        lock_win = ctk.CTkToplevel(self)
+        lock_win.title("Locked")
+        try:
+            lock_win.attributes("-fullscreen", True)
+        except tk.TclError:
+            lock_win.geometry("500x300")
+        lock_win.configure(fg_color=BG_DARK)
+        lock_win.protocol("WM_DELETE_WINDOW", lambda: None)
+        lock_win.grab_set()
+
+        frame = ctk.CTkFrame(lock_win, fg_color="transparent")
+        frame.place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(frame, text="🔒 Locked (inactive)",
+                     font=("Arial Black", 22),
+                     text_color=HIGHLIGHT).pack(pady=10)
+        pass_entry = ctk.CTkEntry(frame, show="•", placeholder_text="Password",
+                                  width=250)
+        pass_entry.pack(pady=10)
+        msg = ctk.CTkLabel(frame, text="", text_color=DANGER)
+        msg.pack()
+        btn_unlock = ctk.CTkButton(frame, text="Unlock", fg_color=SUCCESS,
+                                   hover_color="#059669")
+        btn_unlock.pack(pady=10)
+
+        def unlock_result(ok):
+            btn_unlock.configure(state="normal", text="Unlock")
+            if ok:
+                self._locked = False
+                self._register_activity()
+                lock_win.destroy()
+            else:
+                msg.configure(text="Wrong password.")
+
+        def try_unlock():
+            pw = pass_entry.get()
+            username = self.auth.profile.get("username", "")
+            btn_unlock.configure(state="disabled", text="Checking...")
+
+            def worker():
+                ok, _ = self.auth.login(username, pw)
+                self.after(0, lambda: unlock_result(ok))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_unlock.configure(command=try_unlock)
+        pass_entry.bind("<Return>", lambda e: try_unlock())
 
     # ---------------------------------------------------------- login flow -
     def _on_logged_in(self):
@@ -740,19 +970,66 @@ class KrishnaIntelligence(ctk.CTk):
         try:
             import torch
             from ultralytics import YOLO
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            log.info("Loading YOLOv8 model on %s ...", self.device.upper())
-            model = YOLO("yolov8s.pt")
+            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            self.gpu_count = gpu_count
+            self.gui_queue.put(("gpu_info", gpu_count))
+            if gpu_count > 1:
+                idx = min(max(0, int(self.settings.get("gpu_index", 0))),
+                         gpu_count - 1)
+                self.device = f"cuda:{idx}"
+            elif gpu_count == 1:
+                self.device = "cuda:0"
+            else:
+                self.device = "cpu"
+            model_file = self.settings.get("model_size", "yolov8s.pt")
+            log.info("Loading YOLO model %s on %s ...", model_file,
+                     self.device.upper())
+            model = YOLO(model_file)
             model.to(self.device)
             self.model = model
             self.model_status = "ready"
-            log.info("Model ready on %s", self.device.upper())
+            log.info("Model ready: %s on %s", model_file, self.device.upper())
             self.gui_queue.put(("model_ready", None))
+            self._run_benchmark()
         except Exception as exc:
             self.model_status = "failed"
             self.model_error = str(exc)
             log.error("Model load failed: %s\n%s", exc, traceback.format_exc())
             self.gui_queue.put(("model_failed", str(exc)))
+
+    def _run_benchmark(self):
+        """Quick hardware benchmark right after the model loads."""
+        try:
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            times = []
+            for _ in range(5):
+                t0 = time.time()
+                self.model.predict(dummy, verbose=False)
+                times.append(time.time() - t0)
+            avg = sum(times) / len(times)
+            fps = 1.0 / avg if avg > 0 else 0
+            self.gui_queue.put(("benchmark_done",
+                                f"~{fps:.1f} FPS on {self.device.upper()}"))
+        except Exception as exc:
+            log.warning("Benchmark failed: %s", exc)
+
+    def reload_model(self):
+        """Reload the AI model after changing model size / GPU in settings."""
+        if self.is_scanning:
+            messagebox.showwarning("Busy",
+                                   "Stop the scan before reloading the model.")
+            return
+        self.settings["model_size"] = self.model_size_combo.get()
+        try:
+            gpu_val = self.gpu_combo.get()
+            self.settings["gpu_index"] = int(gpu_val) if gpu_val.isdigit() else 0
+        except (ValueError, AttributeError):
+            pass
+        save_settings(self.settings)
+        self.model_status = "loading"
+        self.model = None
+        self.lbl_status.configure(text="Reloading AI model...", text_color=WARNING)
+        threading.Thread(target=self._load_model, daemon=True).start()
 
     def _reset_tracker(self):
         """Reset tracker state so IDs from one video never leak into the next."""
@@ -776,10 +1053,34 @@ class KrishnaIntelligence(ctk.CTk):
                 f"Reason: {self.model_error}\n\n"
                 "First run needs internet access to download 'yolov8s.pt'.\n"
                 "Check krishna_intelligence.log for details, then restart.")
+        self.after(500, self._check_resume_state)
+        self._last_activity = time.time()
+        self._locked = False
+        self.after(30000, self._check_autolock)
 
     # --------------------------------------------------------------- dirs --
     def setup_directories(self):
         os.makedirs(os.path.join(self.base_dir, "Cases"), exist_ok=True)
+        try:
+            os.makedirs("Known_Suspects", exist_ok=True)
+            readme = os.path.join("Known_Suspects", "README.txt")
+            if not os.path.exists(readme):
+                with open(readme, "w", encoding="utf-8") as f:
+                    f.write(
+                        "Krishna Intelligence - Known Suspects Folder\n"
+                        "=============================================\n"
+                        "To enable face-recognition matching, create one\n"
+                        "sub-folder per person here, named after them, and\n"
+                        "put 2-5 clear face photos (.jpg) inside it, e.g.\n\n"
+                        "  Known_Suspects/\n"
+                        "    Ramesh Patel/\n"
+                        "      photo1.jpg\n"
+                        "      photo2.jpg\n\n"
+                        "Then press 'Train Face Recognizer' in the software.\n"
+                        "Accuracy is basic (LBPH algorithm) - always verify\n"
+                        "matches manually before relying on them.\n")
+        except OSError as exc:
+            log.warning("Could not prepare Known_Suspects folder: %s", exc)
 
     # ----------------------------------------------------------------- UI --
     def setup_ui(self):
@@ -851,7 +1152,25 @@ class KrishnaIntelligence(ctk.CTk):
         self.case_entry = ctk.CTkEntry(case_frame,
                                        placeholder_text="FIR / Case ID...",
                                        height=35)
-        self.case_entry.pack(padx=10, pady=(5, 10), fill="x")
+        self.case_entry.pack(padx=10, pady=(5, 5), fill="x")
+
+        tmpl_row = ctk.CTkFrame(case_frame, fg_color="transparent")
+        tmpl_row.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(tmpl_row, text="Template:", font=("Arial", 9)).pack(side="left")
+        self.template_combo = ctk.CTkComboBox(
+            tmpl_row, values=list(self.CASE_TEMPLATES.keys()),
+            width=150, height=26, command=self.apply_case_template)
+        self.template_combo.set("Custom")
+        self.template_combo.pack(side="left", padx=(6, 0))
+
+        self.status_combo = ctk.CTkComboBox(
+            case_frame, values=["Open", "Under Review", "Closed"], height=28)
+        self.status_combo.set("Open")
+        self.status_combo.pack(padx=10, pady=(0, 5), fill="x")
+
+        self.notes_text = ctk.CTkTextbox(case_frame, height=55,
+                                         fg_color=BG_DARK, font=("Arial", 10))
+        self.notes_text.pack(padx=10, pady=(0, 10), fill="x")
 
         # ---- smart filters ----
         filter_frame = ctk.CTkFrame(self.sidebar, fg_color=BG_DARK, corner_radius=8)
@@ -895,6 +1214,103 @@ class KrishnaIntelligence(ctk.CTk):
                                           font=("Arial", 11),
                                           progress_color=PURPLE)
         self.night_switch.pack(pady=(5, 10), padx=15, anchor="w")
+
+        # ---- advanced AI & security ----
+        adv = ctk.CTkFrame(self.sidebar, fg_color=BG_DARK, corner_radius=8)
+        adv.pack(padx=10, pady=10, fill="x")
+        ctk.CTkLabel(adv, text="🧪 ADVANCED AI & SECURITY",
+                     font=("Arial", 11, "bold"), text_color=ACCENT).pack(pady=(10, 5))
+
+        self.face_rec_switch = ctk.CTkSwitch(
+            adv, text="🧑 Face Recognition (known suspects)", font=("Arial", 10))
+        self.face_rec_switch.pack(pady=(4, 0), padx=15, anchor="w")
+        if not hasattr(cv2, "face"):
+            self.face_rec_switch.configure(state="disabled")
+            ctk.CTkLabel(adv, text="   (needs opencv-contrib-python)",
+                        font=("Arial", 8), text_color="gray").pack(anchor="w", padx=15)
+
+        self.plate_ocr_switch = ctk.CTkSwitch(
+            adv, text="🔢 Number Plate OCR (approx)", font=("Arial", 10))
+        self.plate_ocr_switch.pack(pady=(4, 0), padx=15, anchor="w")
+        if not HAS_TESSERACT:
+            self.plate_ocr_switch.configure(state="disabled")
+            ctk.CTkLabel(adv, text="   (needs pytesseract + Tesseract-OCR)",
+                        font=("Arial", 8), text_color="gray").pack(anchor="w", padx=15)
+
+        self.blur_switch = ctk.CTkSwitch(
+            adv, text="🙈 Blur Faces in Evidence", font=("Arial", 10))
+        self.blur_switch.pack(pady=(4, 0), padx=15, anchor="w")
+
+        self.watermark_switch = ctk.CTkSwitch(
+            adv, text="💧 Watermark Evidence Photos", font=("Arial", 10))
+        self.watermark_switch.pack(pady=(4, 0), padx=15, anchor="w")
+
+        self.encrypt_switch = ctk.CTkSwitch(
+            adv, text="🔒 Encrypt Evidence on Disk", font=("Arial", 10))
+        self.encrypt_switch.pack(pady=(4, 0), padx=15, anchor="w")
+        if not HAS_CRYPTO:
+            self.encrypt_switch.configure(state="disabled")
+            ctk.CTkLabel(adv, text="   (needs: pip install cryptography)",
+                        font=("Arial", 8), text_color="gray").pack(anchor="w", padx=15)
+
+        self.overlay_ts_switch = ctk.CTkSwitch(
+            adv, text="🕐 Read CCTV Overlay Timestamp (approx)", font=("Arial", 10))
+        self.overlay_ts_switch.pack(pady=(4, 10), padx=15, anchor="w")
+        if not HAS_TESSERACT:
+            self.overlay_ts_switch.configure(state="disabled")
+
+        thresh_row = ctk.CTkFrame(adv, fg_color="transparent")
+        thresh_row.pack(fill="x", padx=15, pady=(0, 10))
+        ctk.CTkLabel(thresh_row, text="Loiter(s):", font=("Arial", 9)
+                     ).grid(row=0, column=0, sticky="w")
+        self.loiter_entry = ctk.CTkEntry(thresh_row, width=45, height=24)
+        self.loiter_entry.insert(0, str(self.settings.get("loiter_seconds", 30)))
+        self.loiter_entry.grid(row=0, column=1, padx=(4, 12))
+        ctk.CTkLabel(thresh_row, text="Crowd:", font=("Arial", 9)
+                     ).grid(row=0, column=2, sticky="w")
+        self.crowd_entry = ctk.CTkEntry(thresh_row, width=45, height=24)
+        self.crowd_entry.insert(0, str(self.settings.get("crowd_alert", 8)))
+        self.crowd_entry.grid(row=0, column=3, padx=(4, 0))
+
+        model_row = ctk.CTkFrame(adv, fg_color="transparent")
+        model_row.pack(fill="x", padx=15, pady=(0, 5))
+        ctk.CTkLabel(model_row, text="AI Model:", font=("Arial", 9)).pack(side="left")
+        self.model_size_combo = ctk.CTkComboBox(
+            model_row, width=110, height=26,
+            values=["yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
+                    "yolov8l.pt", "yolov8x.pt"])
+        self.model_size_combo.set(self.settings.get("model_size", "yolov8s.pt"))
+        self.model_size_combo.pack(side="left", padx=(6, 0))
+
+        gpu_row = ctk.CTkFrame(adv, fg_color="transparent")
+        gpu_row.pack(fill="x", padx=15, pady=(0, 8))
+        ctk.CTkLabel(gpu_row, text="GPU:", font=("Arial", 9)).pack(side="left")
+        self.gpu_combo = ctk.CTkComboBox(gpu_row, width=110, height=26,
+                                         values=["CPU/GPU0"], state="disabled")
+        self.gpu_combo.set("CPU/GPU0")
+        self.gpu_combo.pack(side="left", padx=(6, 0))
+
+        ctk.CTkButton(adv, text="🔄 Reload AI Model (apply above)",
+                     font=("Arial", 9), height=28, fg_color="#374151",
+                     command=self.reload_model).pack(fill="x", padx=15, pady=(0, 8))
+        ctk.CTkButton(adv, text="🎯 Train Face Recognizer",
+                     font=("Arial", 9), height=28, fg_color="#374151",
+                     command=self.train_face_recognizer_ui
+                     ).pack(fill="x", padx=15, pady=(0, 8))
+
+        lock_row = ctk.CTkFrame(adv, fg_color="transparent")
+        lock_row.pack(fill="x", padx=15, pady=(0, 10))
+        ctk.CTkLabel(lock_row, text="Auto-lock (min, 0=off):",
+                     font=("Arial", 9)).pack(side="left")
+        self.autolock_entry = ctk.CTkEntry(lock_row, width=45, height=24)
+        self.autolock_entry.insert(0, str(self.settings.get("autolock_minutes", 0)))
+        self.autolock_entry.pack(side="left", padx=(6, 0))
+        ctk.CTkButton(lock_row, text="Save", width=45, height=24,
+                     command=self._save_autolock).pack(side="left", padx=(6, 0))
+
+        ctk.CTkButton(self.sidebar, text="🌓 Toggle Theme (partial)",
+                     font=("Arial", 10), fg_color="#374151", height=32,
+                     command=self.toggle_theme).pack(pady=(0, 5), padx=10, fill="x")
 
         # Reports always upload to the web panel; this only retries the
         # queue when an earlier upload failed (no internet at that time).
@@ -978,6 +1394,10 @@ class KrishnaIntelligence(ctk.CTk):
         ctk.CTkLabel(self.evidence_panel, text="🔍 LIVE EVIDENCE GALLERY",
                      font=("Arial", 12, "bold"),
                      text_color=HIGHLIGHT).pack(pady=(5, 0))
+        self.search_entry = ctk.CTkEntry(self.evidence_panel,
+                                         placeholder_text="🔍 Search evidence...")
+        self.search_entry.pack(fill="x", padx=10, pady=(3, 3))
+        self.search_entry.bind("<KeyRelease>", self._filter_gallery)
         self.gallery = ctk.CTkScrollableFrame(self.evidence_panel,
                                               fg_color="transparent")
         self.gallery.pack(expand=True, fill="both", padx=5, pady=5)
@@ -985,10 +1405,34 @@ class KrishnaIntelligence(ctk.CTk):
         ctk.CTkLabel(self.evidence_panel, text="📅 TIMELINE LOG",
                      font=("Arial", 11, "bold"), text_color=ACCENT
                      ).pack(anchor="w", padx=10, pady=(5, 0))
-        self.timeline_text = ctk.CTkTextbox(self.evidence_panel, height=100,
+        self.timeline_text = ctk.CTkTextbox(self.evidence_panel, height=90,
                                             fg_color=BG_DARK,
                                             font=("Courier", 10))
-        self.timeline_text.pack(fill="x", padx=10, pady=(0, 10))
+        self.timeline_text.pack(fill="x", padx=10, pady=(0, 5))
+
+        tools1 = ctk.CTkFrame(self.evidence_panel, fg_color="transparent")
+        tools1.pack(fill="x", padx=10, pady=(0, 3))
+        ctk.CTkButton(tools1, text="➕ Manual", height=28, font=("Arial", 9),
+                     fg_color="#374151", command=self.add_manual_evidence
+                     ).pack(side="left", expand=True, fill="x", padx=2)
+        ctk.CTkButton(tools1, text="📦 ZIP", height=28, font=("Arial", 9),
+                     fg_color="#374151", command=self.bulk_export_zip
+                     ).pack(side="left", expand=True, fill="x", padx=2)
+        ctk.CTkButton(tools1, text="📊 Stats", height=28, font=("Arial", 9),
+                     fg_color="#374151", command=self.show_analytics
+                     ).pack(side="left", expand=True, fill="x", padx=2)
+
+        tools2 = ctk.CTkFrame(self.evidence_panel, fg_color="transparent")
+        tools2.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(tools2, text="📁 Recent", height=28, font=("Arial", 9),
+                     fg_color="#374151", command=self.show_recent_cases
+                     ).pack(side="left", expand=True, fill="x", padx=2)
+        ctk.CTkButton(tools2, text="🆚 Compare", height=28, font=("Arial", 9),
+                     fg_color="#374151", command=self.compare_cases
+                     ).pack(side="left", expand=True, fill="x", padx=2)
+        ctk.CTkButton(tools2, text="🖨 Print", height=28, font=("Arial", 9),
+                     fg_color="#374151", command=self.print_last_report
+                     ).pack(side="left", expand=True, fill="x", padx=2)
 
     # -------------------------------------------------------- UI callbacks -
     def _on_video_area_resize(self, event):
@@ -999,10 +1443,102 @@ class KrishnaIntelligence(ctk.CTk):
         self.frame_skip = max(1, int(val))
         self.speed_label.configure(text=f"Speed: Every {self.frame_skip} frames")
 
+    @staticmethod
+    def _safe_int(text, default=0):
+        try:
+            return max(0, int(text))
+        except (TypeError, ValueError):
+            return default
+
+    def apply_case_template(self, choice):
+        tmpl = self.CASE_TEMPLATES.get(choice)
+        if not tmpl:
+            return
+        self.object_filter.set(tmpl["object"])
+        self.color_filter.set(tmpl["color"])
+
+    def toggle_theme(self):
+        new_theme = "light" if self.settings.get("theme", "dark") == "dark" else "dark"
+        self.settings["theme"] = new_theme
+        save_settings(self.settings)
+        ctk.set_appearance_mode(new_theme)
+        messagebox.showinfo(
+            "Theme Changed",
+            "Appearance mode updated.\nNote: this UI uses a fixed dark "
+            "color palette for CCTV/low-light viewing comfort, so panel "
+            "colors will not fully invert — a full light theme needs a "
+            "larger redesign.")
+
+    def _save_autolock(self):
+        self.settings["autolock_minutes"] = self._safe_int(
+            self.autolock_entry.get(), 0)
+        save_settings(self.settings)
+        messagebox.showinfo("Saved", "Auto-lock setting saved.")
+
+    def train_face_recognizer_ui(self):
+        if not hasattr(cv2, "face"):
+            messagebox.showerror(
+                "Unavailable",
+                "Face recognition needs 'opencv-contrib-python'.\n"
+                "Install it with:\npip install opencv-contrib-python")
+            return
+        self.lbl_status.configure(text="Training face recognizer...",
+                                  text_color=ACCENT)
+
+        def worker():
+            ok, msg_text = self._train_face_recognizer()
+            self.after(0, lambda: self._train_done(ok, msg_text))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _train_done(self, ok, msg_text):
+        self.lbl_status.configure(
+            text="✅ System Ready" if self.model_status == "ready"
+            else "Please login...", text_color=SUCCESS)
+        if ok:
+            messagebox.showinfo("Training Complete", msg_text)
+        else:
+            messagebox.showwarning("Training Failed", msg_text)
+
+    def _train_face_recognizer(self):
+        """Train an LBPH recognizer from Known_Suspects/<name>/*.jpg."""
+        if not hasattr(cv2, "face"):
+            return False, "opencv-contrib-python not installed."
+        if self.face_cascade is None:
+            return False, "Face detector unavailable on this install."
+        base = "Known_Suspects"
+        if not os.path.isdir(base):
+            return False, "No 'Known_Suspects' folder found."
+        people = sorted(d for d in os.listdir(base)
+                        if os.path.isdir(os.path.join(base, d)))
+        if not people:
+            return False, "No suspect sub-folders found in Known_Suspects."
+        faces, labels = [], []
+        for idx, person in enumerate(people):
+            pdir = os.path.join(base, person)
+            for fname in os.listdir(pdir):
+                img = cv2.imread(os.path.join(pdir, fname), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                dets = self.face_cascade.detectMultiScale(img, 1.1, 5)
+                for (x, y, w, h) in dets:
+                    faces.append(cv2.resize(img[y:y + h, x:x + w], (200, 200)))
+                    labels.append(idx)
+        if not faces:
+            return False, "No faces detected in Known_Suspects photos."
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
+        recognizer.train(faces, np.array(labels))
+        self.face_recognizer = recognizer
+        self.face_labels = dict(enumerate(people))
+        return True, (f"Trained on {len(people)} known suspect folder(s), "
+                      f"{len(faces)} face sample(s).")
+
     def import_videos(self):
         files = filedialog.askopenfilenames(
             title="Select Videos",
-            filetypes=[("Video Files", "*.mp4 *.avi *.mkv *.mov *.wmv *.dav *.h264")])
+            filetypes=[("Video Files",
+                       "*.mp4 *.avi *.mkv *.mov *.wmv *.dav *.h264 "
+                       "*.ts *.mts *.m4v *.flv *.3gp *.asf")])
         if files:
             self.video_list = list(files)
             self.batch_label.configure(text=f"Queue: {len(files)} Videos Loaded")
@@ -1047,22 +1583,41 @@ class KrishnaIntelligence(ctk.CTk):
         self.current_case_id = case_id
         self.current_case_dir = os.path.join(self.base_dir, "Cases", case_id)
         os.makedirs(self.current_case_dir, exist_ok=True)
+        self._add_recent_case(case_id)
 
         # Snapshot every UI setting ONCE on the main thread — the worker
         # thread must never touch tkinter widgets directly.
+        loiter_seconds = self._safe_int(self.loiter_entry.get(), 30)
+        crowd_alert = self._safe_int(self.crowd_entry.get(), 8)
         self.scan_config = {
             "object_filter": self.object_filter.get(),
             "color_filter": self.color_filter.get(),
             "night_mode": bool(self.night_switch.get()),
             "enhance": bool(self.enhance_switch.get()),
             "conf": self.conf_threshold,
+            "face_recognition": bool(self.face_rec_switch.get()),
+            "plate_ocr": bool(self.plate_ocr_switch.get()),
+            "blur_faces": bool(self.blur_switch.get()),
+            "watermark": bool(self.watermark_switch.get()),
+            "encrypt_evidence": bool(self.encrypt_switch.get()),
+            "read_overlay_ts": bool(self.overlay_ts_switch.get()),
+            "loiter_seconds": loiter_seconds,
+            "crowd_alert": crowd_alert,
         }
+        self.settings["loiter_seconds"] = loiter_seconds
+        self.settings["crowd_alert"] = crowd_alert
+        save_settings(self.settings)
 
         self.is_scanning = True
         self.is_stopped = False
         self.pause_event.clear()
         self.current_video_idx = 0
         self.tracked_ids.clear()
+        self.track_positions.clear()
+        self.track_first_seen.clear()
+        self.track_flagged_loiter.clear()
+        self.evidence_by_track.clear()
+        self.video_hashes.clear()
         self.stats.clear()
         self.evidence_database.clear()
         self.scan_started_at = datetime.now()
@@ -1077,6 +1632,7 @@ class KrishnaIntelligence(ctk.CTk):
         log.info("Scan started | case=%s videos=%d config=%s",
                  case_id, len(self.video_list), self.scan_config)
 
+        self._save_resume_state()
         self.process_next_video()
 
     def stop_analysis(self):
@@ -1097,6 +1653,204 @@ class KrishnaIntelligence(ctk.CTk):
         else:
             self.finish_analysis()
 
+    # ------------------------------------------------------- resume state --
+    def _save_resume_state(self):
+        try:
+            with open(RESUME_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "case_id": self.current_case_id,
+                    "video_list": self.video_list,
+                    "video_idx": self.current_video_idx,
+                    "scan_config": self.scan_config,
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                }, f)
+        except OSError as exc:
+            log.warning("Could not save resume state: %s", exc)
+
+    def _clear_resume_state(self):
+        try:
+            if os.path.exists(RESUME_FILE):
+                os.remove(RESUME_FILE)
+        except OSError:
+            pass
+
+    def _check_resume_state(self):
+        try:
+            with open(RESUME_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        video_list = data.get("video_list", [])
+        idx = data.get("video_idx", 0)
+        remaining = len(video_list) - idx
+        if remaining <= 0 or not all(os.path.exists(v) for v in video_list[idx:]):
+            self._clear_resume_state()
+            return
+        if not messagebox.askyesno(
+                "Resume Scan?",
+                f"An interrupted scan was found for case "
+                f"'{data.get('case_id')}'.\n{remaining} video(s) remain.\n\n"
+                "Resume this scan now?"):
+            self._clear_resume_state()
+            return
+
+        self._load_case_for_review(data["case_id"])
+        self.video_list = video_list
+        self.current_video_idx = idx
+        self.scan_config = data.get("scan_config", {})
+        self.is_scanning = True
+        self.is_stopped = False
+        self.pause_event.clear()
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.btn_pause.configure(state="normal", text="⏸ PAUSE")
+        self.btn_import.configure(state="disabled")
+        self.batch_label.configure(
+            text=f"🔍 Resuming case '{data['case_id']}' — "
+                 f"{idx}/{len(video_list)} already done")
+        self.process_next_video()
+
+    # -------------------------------------------------------- recent cases
+    def _load_recent_cases(self):
+        try:
+            with open(RECENT_CASES_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return []
+
+    def _add_recent_case(self, case_id):
+        recents = self._load_recent_cases()
+        recents = [c for c in recents if c.get("case_id") != case_id]
+        recents.insert(0, {"case_id": case_id,
+                           "opened_at": datetime.now().isoformat(timespec="seconds")})
+        recents = recents[:20]
+        try:
+            with open(RECENT_CASES_FILE, "w", encoding="utf-8") as f:
+                json.dump(recents, f, indent=2)
+        except OSError as exc:
+            log.warning("Could not save recent cases: %s", exc)
+
+    def _list_case_ids(self):
+        d = os.path.join(self.base_dir, "Cases")
+        if not os.path.isdir(d):
+            return []
+        return sorted(x for x in os.listdir(d) if os.path.isdir(os.path.join(d, x)))
+
+    def show_recent_cases(self):
+        recents = self._load_recent_cases()
+        if not recents:
+            messagebox.showinfo("Recent Cases", "No recent cases yet.")
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("📁 Recent Cases")
+        win.geometry("380x420")
+        win.configure(fg_color=BG_DARK)
+        ctk.CTkLabel(win, text="📁 Recent Cases (click to review)",
+                     font=("Arial", 13, "bold"),
+                     text_color=HIGHLIGHT).pack(pady=10)
+        scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        scroll.pack(expand=True, fill="both", padx=10, pady=10)
+        for c in recents:
+            row = ctk.CTkFrame(scroll, fg_color=PANEL_BG, corner_radius=6)
+            row.pack(fill="x", pady=3)
+            ctk.CTkButton(
+                row, text=f"📂 {c['case_id']}", anchor="w",
+                fg_color="transparent", hover_color="#1F2937",
+                command=lambda cid=c["case_id"], w=win: (
+                    w.destroy(), self._load_case_for_review(cid))
+            ).pack(fill="x", padx=5, pady=5)
+
+    def _load_case_for_review(self, case_id):
+        """Rebuild the gallery from evidence photos already saved on disk
+        for a past case (best-effort filename parsing; read-only)."""
+        case_dir = os.path.join(self.base_dir, "Cases", case_id)
+        if not os.path.isdir(case_dir):
+            messagebox.showwarning("Not Found",
+                                   f"Case folder not found:\n{case_dir}")
+            return
+        self.clear_gallery()
+        self.evidence_database.clear()
+        self.timeline_text.delete("1.0", tk.END)
+        count = 0
+        for root, _, files in os.walk(case_dir):
+            for fname in sorted(files):
+                low = fname.lower()
+                if not (low.endswith(".jpg") or low.endswith(".jpeg")
+                       or low.endswith(".png") or low.endswith(".jpg.enc")):
+                    continue
+                fpath = os.path.join(root, fname)
+                m = re.match(r"ID_(\S+?)_(\w+)_(\w+)_(\d+m_\d+s)", fname)
+                encrypted = fname.endswith(".enc")
+                entry = {
+                    "filename": fname,
+                    "type": m.group(3) if m else "Unknown",
+                    "track_id": m.group(1) if m else "-",
+                    "color": m.group(2) if m else "-",
+                    "timestamp": m.group(4) if m else "-",
+                    "video": os.path.basename(root), "filepath": fpath,
+                    "source_path": "", "frame_idx": 0,
+                    "note": "", "starred": False, "encrypted": encrypted,
+                    "upper_color": "", "lower_color": "", "direction": "",
+                    "speed_px_s": 0, "face_match": "", "plate_text": "",
+                }
+                try:
+                    if encrypted:
+                        thumb_img = Image.new("RGB", (100, 60), "#333333")
+                    else:
+                        thumb_img = Image.open(fpath)
+                except Exception:
+                    continue
+                self.evidence_database.append(entry)
+                self.gui_queue.put(("evidence", thumb_img, entry))
+                count += 1
+        self.current_case_id = case_id
+        self.current_case_dir = case_dir
+        self.case_entry.delete(0, tk.END)
+        self.case_entry.insert(0, case_id)
+        self.timeline_text.insert(
+            tk.END, f"📂 Loaded {count} evidence item(s) from case "
+                    f"'{case_id}' for review.\n")
+        self.lbl_status.configure(text=f"Reviewing case: {case_id}",
+                                  text_color=ACCENT)
+
+    def compare_cases(self):
+        cases = self._list_case_ids()
+        if len(cases) < 2:
+            messagebox.showinfo("Compare Cases",
+                                "Need at least 2 saved cases to compare.")
+            return
+        CaseCompareDialog(self, cases, self._do_compare)
+
+    def _do_compare(self, case_a, case_b):
+        def sig(case_id):
+            d = os.path.join(self.base_dir, "Cases", case_id)
+            sigs = set()
+            for root, _, files in os.walk(d):
+                for fname in files:
+                    m = re.match(r"ID_(\S+?)_(\w+)_(\w+)_", fname)
+                    if m:
+                        sigs.add((m.group(3), m.group(2)))  # (type, color)
+            return sigs
+
+        common = sig(case_a) & sig(case_b)
+        msg = (f"Possible common type+color combinations between\n"
+               f"'{case_a}' and '{case_b}':\n\n" +
+               ("\n".join(f"- {t} ({c})" for t, c in sorted(common))
+                if common else "None found.") +
+               "\n\n⚠ This is a rough heuristic (type + color only) — "
+               "NOT identity confirmation. Verify manually.")
+        messagebox.showinfo("Comparison Result", msg)
+
+    def _cross_video_matches(self):
+        groups = defaultdict(set)
+        for e in self.evidence_database:
+            groups[(e["type"], e["color"])].add(e["video"])
+        matches = []
+        for (t, c), vids in groups.items():
+            if len(vids) > 1:
+                matches.append(f"{t} ({c}) seen across: {', '.join(sorted(vids))}")
+        return matches
+
     # ---------------------------------------------------------- core engine
     def core_engine(self, video_path, config):
         """Analyse one video in a background thread.
@@ -1115,20 +1869,84 @@ class KrishnaIntelligence(ctk.CTk):
         finally:
             self.gui_queue.put(("video_done", None))
 
+    def _try_ffmpeg_repair(self, video_path):
+        """Best-effort remux of a video ffmpeg/OpenCV refuses to open."""
+        if not shutil.which("ffmpeg"):
+            return None
+        try:
+            tmp = os.path.join(
+                tempfile.gettempdir(),
+                f"krishna_repair_{os.getpid()}_{int(time.time())}.mp4")
+            subprocess.run(
+                ["ffmpeg", "-y", "-err_detect", "ignore_err", "-i", video_path,
+                 "-c", "copy", tmp],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=120, check=False)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                return tmp
+        except Exception as exc:
+            log.warning("ffmpeg repair failed: %s", exc)
+        return None
+
+    def _read_overlay_timestamp(self, frame):
+        """Best-effort OCR of a CCTV date/time burned into the top-left
+        corner of the frame. Accuracy depends entirely on the camera's
+        overlay style/font — treat as approximate."""
+        if not HAS_TESSERACT:
+            return ""
+        try:
+            h, w = frame.shape[:2]
+            roi = frame[0:int(h * 0.08), 0:int(w * 0.35)]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, None, fx=2, fy=2)
+            text = pytesseract.image_to_string(gray, config="--psm 7")
+            return text.strip()
+        except Exception:
+            return ""
+
     def _run_video(self, video_path, config):
         vid_name = os.path.splitext(os.path.basename(video_path))[0]
         output_dir = os.path.join(self.current_case_dir, vid_name)
         os.makedirs(output_dir, exist_ok=True)
+        self._current_video_path = video_path
 
+        repaired_tmp = None
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            self.gui_queue.put(
-                ("video_error",
-                 f"⚠ Could not open video: {os.path.basename(video_path)}\n"))
-            return
+            repaired_tmp = self._try_ffmpeg_repair(video_path)
+            if repaired_tmp:
+                cap = cv2.VideoCapture(repaired_tmp)
+                self.gui_queue.put(
+                    ("video_error",
+                     f"🔧 Repaired and reopened corrupt video: "
+                     f"{os.path.basename(video_path)}\n"))
+            if not cap.isOpened():
+                self.gui_queue.put(
+                    ("video_error",
+                     f"⚠ Could not open video: {os.path.basename(video_path)}\n"))
+                if repaired_tmp and os.path.exists(repaired_tmp):
+                    try:
+                        os.remove(repaired_tmp)
+                    except OSError:
+                        pass
+                return
+
+        try:
+            self.video_hashes[vid_name] = sha256_file(video_path)
+        except OSError as exc:
+            log.warning("Could not hash video %s: %s", video_path, exc)
+            self.video_hashes[vid_name] = ""
 
         # Fresh tracker per video so IDs never carry over between files.
         self._reset_tracker()
+
+        rotate_code = None
+        try:
+            meta = int(cap.get(cv2.CAP_PROP_ORIENTATION_META))
+            rotate_code = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+                           270: cv2.ROTATE_90_COUNTERCLOCKWISE}.get(meta)
+        except Exception:
+            rotate_code = None
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -1136,6 +1954,7 @@ class KrishnaIntelligence(ctk.CTk):
             fps = 30.0
         frame_idx = 0
         start_time = time.time()
+        overlay_read = False
 
         try:
             while not self.is_stopped:
@@ -1145,6 +1964,17 @@ class KrishnaIntelligence(ctk.CTk):
                 ret, frame = cap.read()
                 if not ret:
                     break
+                if rotate_code is not None:
+                    frame = cv2.rotate(frame, rotate_code)
+
+                if not overlay_read and config.get("read_overlay_ts"):
+                    overlay_read = True
+                    ts_text = self._read_overlay_timestamp(frame)
+                    if ts_text:
+                        self.gui_queue.put(
+                            ("timeline",
+                             f"🕐 Overlay timestamp (OCR, approx) for "
+                             f"{vid_name}: {ts_text}\n"))
 
                 if frame_idx % self.frame_skip == 0:
                     self._process_frame(frame, frame_idx, fps, vid_name,
@@ -1160,6 +1990,11 @@ class KrishnaIntelligence(ctk.CTk):
                 frame_idx += 1
         finally:
             cap.release()
+            if repaired_tmp and os.path.exists(repaired_tmp):
+                try:
+                    os.remove(repaired_tmp)
+                except OSError:
+                    pass
 
     def _process_frame(self, frame, frame_idx, fps, vid_name, output_dir, config):
         results = self.model.track(frame, conf=config["conf"],
@@ -1171,6 +2006,49 @@ class KrishnaIntelligence(ctk.CTk):
             ids = result.boxes.id.int().cpu().tolist()
             clss = result.boxes.cls.int().cpu().tolist()
             boxes = result.boxes.xyxy.cpu().numpy()
+
+            # Track history (all detected ids) feeds direction/speed and
+            # loitering/crowd alerts — independent of evidence dedupe.
+            person_count = 0
+            for box, tid, cls in zip(boxes, ids, clss):
+                if cls == 0:
+                    person_count += 1
+                key = (vid_name, tid)
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                hist = self.track_positions.setdefault(key, [])
+                hist.append((frame_idx, cx, cy))
+                if len(hist) > 40:
+                    hist.pop(0)
+                # Evidence is captured on first sighting (no history yet),
+                # so keep its direction/speed fresh as the track moves.
+                tracked_entry = self.evidence_by_track.get(key)
+                if tracked_entry is not None:
+                    tracked_entry["direction"] = self._movement_direction(
+                        vid_name, tid)
+                    tracked_entry["speed_px_s"] = round(
+                        self._movement_speed(vid_name, tid, fps), 1)
+                if key not in self.track_first_seen:
+                    self.track_first_seen[key] = frame_idx
+                elapsed_sec = (frame_idx - self.track_first_seen[key]) / fps
+                loiter_limit = config.get("loiter_seconds", 0)
+                if (loiter_limit and elapsed_sec >= loiter_limit
+                        and key not in self.track_flagged_loiter):
+                    self.track_flagged_loiter.add(key)
+                    self.gui_queue.put(
+                        ("timeline",
+                         f"⚠ Loitering Alert: ID {tid} present "
+                         f"{int(elapsed_sec)}s in {vid_name}\n"))
+
+            if person_count > self.stats.get("max_crowd", 0):
+                self.stats["max_crowd"] = person_count
+            crowd_limit = config.get("crowd_alert", 0)
+            if (crowd_limit and person_count >= crowd_limit
+                    and frame_idx % max(1, self.frame_skip * 20) == 0):
+                self.gui_queue.put(
+                    ("timeline",
+                     f"👥 Crowd Alert: {person_count} persons visible in "
+                     f"{vid_name} (frame {frame_idx})\n"))
+
             for box, tid, cls in zip(boxes, ids, clss):
                 self._capture_evidence(frame, box, tid, cls, frame_idx, fps,
                                        vid_name, output_dir, config)
@@ -1222,35 +2100,200 @@ class KrishnaIntelligence(ctk.CTk):
 
         self.tracked_ids.add(key)
 
+        # ---- extra AI analysis (best-effort, never blocks capture) ----
+        upper_color, lower_color = "", ""
+        face_match_name = ""
+        plate_text = ""
+        try:
+            if cat_name == "Person":
+                upper_color, lower_color = self._clothing_colors(crop)
+                if config.get("face_recognition") and self.face_recognizer is not None:
+                    match = self._try_face_match(crop)
+                    if match:
+                        face_match_name = match[0]
+            elif cat_name in self.VEHICLES and config.get("plate_ocr"):
+                plate_text = self._read_plate(crop)
+        except Exception as exc:
+            log.warning("Extra analysis failed for ID %s: %s", tid, exc)
+
+        if (cat_name == "Person" and config.get("blur_faces")
+                and self.face_cascade is not None):
+            try:
+                crop = self._blur_faces(crop)
+            except Exception as exc:
+                log.warning("Face blur failed: %s", exc)
+
         if config["night_mode"]:
             crop = self.enhance_night(crop)
         elif config["enhance"]:
             crop = self.enhance_basic(crop)
 
+        if config.get("watermark"):
+            crop = self._apply_watermark(crop)
+
+        direction = self._movement_direction(vid_name, tid)
+        speed_px_s = self._movement_speed(vid_name, tid, fps)
+
         seconds = int(frame_idx / fps)
         timestamp_str = f"{seconds // 60:02d}m_{seconds % 60:02d}s"
-        filename = f"ID_{tid}_{color}_{cat_name}_{timestamp_str}_f{frame_idx}.jpg"
+        base_filename = f"ID_{tid}_{color}_{cat_name}_{timestamp_str}_f{frame_idx}.jpg"
+
+        ok, buf = cv2.imencode(".jpg", crop)
+        if not ok:
+            return
+        raw_bytes = buf.tobytes()
+
+        encrypted = bool(config.get("encrypt_evidence")) and HAS_CRYPTO
+        filename = base_filename + (".enc" if encrypted else "")
         filepath = os.path.join(output_dir, filename)
-        cv2.imwrite(filepath, crop)
+        try:
+            if encrypted:
+                token = self._fernet().encrypt(raw_bytes)
+                with open(filepath, "wb") as f:
+                    f.write(token)
+            else:
+                with open(filepath, "wb") as f:
+                    f.write(raw_bytes)
+        except OSError as exc:
+            log.error("Could not save evidence file: %s", exc)
+            return
 
         if cat_name == "Person":
             self.stats["persons"] += 1
         elif cat_name in self.VEHICLES:
             self.stats["vehicles"] += 1
 
-        self.evidence_database.append({
+        entry = {
             "filename": filename, "type": cat_name, "track_id": tid,
             "color": color, "timestamp": timestamp_str, "video": vid_name,
             "filepath": os.path.abspath(filepath),
-        })
+            "source_path": self._current_video_path, "frame_idx": frame_idx,
+            "note": "", "starred": False, "encrypted": encrypted,
+            "upper_color": upper_color, "lower_color": lower_color,
+            "direction": direction, "speed_px_s": round(speed_px_s, 1),
+            "face_match": face_match_name, "plate_text": plate_text,
+        }
+        self.evidence_database.append(entry)
+        self.evidence_by_track[key] = entry
 
-        self.gui_queue.put(("timeline",
-                            f"[{vid_name} {timestamp_str}] {cat_name} "
-                            f"(ID:{tid}) | Color: {color}\n"))
-        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        self.gui_queue.put(("evidence", Image.fromarray(crop_rgb), cat_name,
-                            color, timestamp_str, tid, filepath))
+        tl = (f"[{vid_name} {timestamp_str}] {cat_name} (ID:{tid}) | "
+              f"Color: {color}")
+        if face_match_name:
+            tl += f" | ⚠ POSSIBLE MATCH: {face_match_name}"
+        if plate_text:
+            tl += f" | Plate(OCR): {plate_text}"
+        if direction:
+            tl += f" | Dir: {direction}"
+        tl += "\n"
+        self.gui_queue.put(("timeline", tl))
+
+        decoded = cv2.imdecode(np.frombuffer(raw_bytes, np.uint8), cv2.IMREAD_COLOR)
+        crop_rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+        self.gui_queue.put(("evidence", Image.fromarray(crop_rgb), entry))
         self.gui_queue.put(("stats_update", None))
+
+    # -------------------------------------------------- extra AI helpers --
+    def _clothing_colors(self, crop):
+        h, w = crop.shape[:2]
+        upper = crop[int(h * 0.15):int(h * 0.5), int(w * 0.15):int(w * 0.85)]
+        lower = crop[int(h * 0.5):int(h * 0.9), int(w * 0.15):int(w * 0.85)]
+        up = self.detect_color(upper) if upper.size else "Unknown"
+        lo = self.detect_color(lower) if lower.size else "Unknown"
+        return up, lo
+
+    def _movement_direction(self, vid_name, tid):
+        hist = self.track_positions.get((vid_name, tid))
+        if not hist or len(hist) < 2:
+            return ""
+        _, x0, y0 = hist[0]
+        _, x1, y1 = hist[-1]
+        dx, dy = x1 - x0, y1 - y0
+        if abs(dx) < 15 and abs(dy) < 15:
+            return "Stationary"
+        angle = math.degrees(math.atan2(-dy, dx))
+        dirs = ["East", "NE", "North", "NW", "West", "SW", "South", "SE"]
+        idx = int((angle + 22.5) % 360 // 45)
+        return dirs[idx]
+
+    def _movement_speed(self, vid_name, tid, fps):
+        """Approximate, uncalibrated speed in pixels/second (relative
+        only — there is no real-world distance reference from a single
+        camera, so this is NOT a calibrated km/h speed)."""
+        hist = self.track_positions.get((vid_name, tid))
+        if not hist or len(hist) < 2:
+            return 0.0
+        f0, x0, y0 = hist[0]
+        f1, x1, y1 = hist[-1]
+        dist_px = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+        seconds = (f1 - f0) / fps
+        return dist_px / seconds if seconds > 0 else 0.0
+
+    def _fernet(self):
+        if not HAS_CRYPTO:
+            return None
+        if self._fernet_obj is None:
+            self._fernet_obj = Fernet(get_or_create_encryption_key())
+        return self._fernet_obj
+
+    def _blur_faces(self, crop_bgr):
+        if self.face_cascade is None:
+            return crop_bgr
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        dets = self.face_cascade.detectMultiScale(gray, 1.1, 5)
+        out = crop_bgr.copy()
+        for (x, y, w, h) in dets:
+            roi = out[y:y + h, x:x + w]
+            out[y:y + h, x:x + w] = cv2.GaussianBlur(roi, (23, 23), 30)
+        return out
+
+    def _try_face_match(self, crop_bgr):
+        if self.face_recognizer is None or self.face_cascade is None:
+            return None
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        dets = self.face_cascade.detectMultiScale(gray, 1.1, 5)
+        if len(dets) == 0:
+            return None
+        x, y, w, h = max(dets, key=lambda d: d[2] * d[3])
+        face = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
+        label, confidence = self.face_recognizer.predict(face)
+        if confidence < 80:  # LBPH: lower = better match
+            return self.face_labels.get(label, "Unknown"), confidence
+        return None
+
+    def _read_plate(self, crop_bgr):
+        """Best-effort number-plate OCR on the whole vehicle crop (no
+        dedicated plate detector) — works best on close, sharp plates."""
+        if not HAS_TESSERACT:
+            return ""
+        try:
+            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, None, fx=2, fy=2,
+                              interpolation=cv2.INTER_CUBIC)
+            _, thresh = cv2.threshold(gray, 0, 255,
+                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            text = pytesseract.image_to_string(
+                thresh,
+                config="--psm 7 -c tessedit_char_whitelist="
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+            text = re.sub(r"[^A-Z0-9]", "", text.upper())
+            return text[:15]
+        except Exception as exc:
+            log.warning("Plate OCR failed: %s", exc)
+            return ""
+
+    def _apply_watermark(self, image):
+        try:
+            h, _ = image.shape[:2]
+            text = f"{APP_NAME} - EVIDENCE"
+            out = image.copy()
+            cv2.putText(out, text, (5, h - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                       0.35, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(out, text, (5, h - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                       0.35, (255, 255, 255), 1, cv2.LINE_AA)
+            return out
+        except Exception as exc:
+            log.warning("Watermark failed: %s", exc)
+            return image
 
     # ------------------------------------------------------- image helpers -
     def detect_color(self, crop):
@@ -1327,9 +2370,13 @@ class KrishnaIntelligence(ctk.CTk):
         self.btn_pause.configure(state="disabled", text="⏸ PAUSE")
         self.btn_import.configure(state="normal")
         self.progress.set(1.0)
+        self._clear_resume_state()
 
         if not self.current_case_dir:
             return
+
+        for match in self._cross_video_matches():
+            self.gui_queue.put(("timeline", f"🔗 {match}\n"))
 
         # Reports are NEVER kept as local files — the report (PDF + JSON)
         # is built into the hidden upload queue and pushed to the web
@@ -1384,10 +2431,16 @@ class KrishnaIntelligence(ctk.CTk):
                 "started": self.scan_started_at.isoformat(timespec="seconds")
                 if self.scan_started_at else None,
                 "status": "ABORTED" if aborted else "COMPLETED",
+                "case_status": self.status_combo.get(),
+                "case_notes": self.notes_text.get("1.0", tk.END).strip(),
                 "videos": [os.path.basename(v) for v in self.video_list],
+                "video_hashes": dict(self.video_hashes),
                 "stats": {"persons": self.stats.get("persons", 0),
                           "vehicles": self.stats.get("vehicles", 0),
+                          "max_crowd": self.stats.get("max_crowd", 0),
                           "total_evidence": len(self.evidence_database)},
+                "possible_cross_video_matches": self._cross_video_matches(),
+                "verification_code": self._report_verification_code(),
                 "evidence": self.evidence_database,
             }
             with open(os.path.join(qdir, "report.json"), "w",
@@ -1450,6 +2503,15 @@ class KrishnaIntelligence(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _report_verification_code(self):
+        """A lightweight authenticity marker (SHA-256 short code), not a
+        legal PKI digital signature — useful to spot-check that a report's
+        headline numbers were not altered after generation."""
+        raw = (f"{self.current_case_id}|{self.stats.get('persons', 0)}|"
+               f"{self.stats.get('vehicles', 0)}|{len(self.evidence_database)}|"
+               f"{self.auth.profile.get('username', '')}")
+        return hashlib.sha256(raw.encode()).hexdigest()[:10].upper()
+
     # ---------------------------------------------------------- PDF build --
     def _build_pdf(self, path):
         """Write the case PDF report to `path`. Returns (ok, error)."""
@@ -1464,8 +2526,22 @@ class KrishnaIntelligence(ctk.CTk):
             from reportlab.platypus import (SimpleDocTemplate, Paragraph,
                                             Spacer, Table, TableStyle,
                                             Image as RLImage)
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
         except ImportError:
             return False, "reportlab is not installed (pip install reportlab)."
+
+        # Optional Gujarati Unicode font for case notes — only active if the
+        # operator has placed a font file at fonts/NotoSansGujarati-Regular.ttf
+        # (not bundled here). Falls back to the default Latin font otherwise,
+        # in which case Gujarati text in notes will not render correctly.
+        gujarati_font = None
+        try:
+            if os.path.exists(GUJARATI_FONT_PATH):
+                pdfmetrics.registerFont(TTFont("NotoGujarati", GUJARATI_FONT_PATH))
+                gujarati_font = "NotoGujarati"
+        except Exception as exc:
+            log.warning("Gujarati font registration failed: %s", exc)
 
         try:
             profile = self.auth.profile or {}
@@ -1504,21 +2580,58 @@ class KrishnaIntelligence(ctk.CTk):
                           f"<b>Vehicles:</b> {self.stats.get('vehicles', 0)} &nbsp;&nbsp;"
                           f"<b>Total evidence:</b> {len(self.evidence_database)}",
                           small),
-                Spacer(1, 14),
+                Paragraph(f"<b>Case Status:</b> {self.status_combo.get()}", small),
             ]
+            case_notes = self.notes_text.get("1.0", tk.END).strip()
+            if case_notes:
+                note_style = small
+                if gujarati_font:
+                    note_style = ParagraphStyle(
+                        "Notes", parent=small, fontName=gujarati_font)
+                story.append(Paragraph(
+                    f"<b>Case Notes:</b> {case_notes}", note_style))
+            story.append(Spacer(1, 14))
 
             rows = [["Photo", "Details"]]
             for item in self.evidence_database:
+                extra = ""
+                if item.get("upper_color") or item.get("lower_color"):
+                    extra += (f"Clothing: {item.get('upper_color', '-')} (top) / "
+                             f"{item.get('lower_color', '-')} (bottom)<br/>")
+                if item.get("direction"):
+                    extra += (f"Direction: {item['direction']} | "
+                             f"Speed(approx): {item.get('speed_px_s', 0)} px/s<br/>")
+                if item.get("face_match"):
+                    extra += f"⚠ Possible Match: {item['face_match']}<br/>"
+                if item.get("plate_text"):
+                    extra += f"Plate (OCR, approx): {item['plate_text']}<br/>"
+                if item.get("note"):
+                    extra += f"Note: {item['note']}<br/>"
                 details = Paragraph(
-                    f"<b>{item['type']}</b> (Track ID {item['track_id']})<br/>"
+                    f"<b>{item['type']}</b> (Track ID {item['track_id']})"
+                    f"{' ★' if item.get('starred') else ''}<br/>"
                     f"Color: {item['color']}<br/>"
                     f"Time: {item['timestamp'].replace('_', ' ')}<br/>"
                     f"Video: {item['video']}<br/>"
-                    f"File: {item['filename']}", small)
+                    f"File: {item['filename']}<br/>" + extra, small)
+
+                img_source = None
                 img_path = item.get("filepath", "")
-                if img_path and os.path.exists(img_path):
+                if item.get("encrypted") and HAS_CRYPTO and img_path \
+                        and os.path.exists(img_path):
                     try:
-                        img = RLImage(img_path)
+                        with open(img_path, "rb") as f:
+                            token = f.read()
+                        raw = self._fernet().decrypt(token)
+                        img_source = io.BytesIO(raw)
+                    except Exception:
+                        img_source = None
+                elif img_path and os.path.exists(img_path):
+                    img_source = img_path
+
+                if img_source is not None:
+                    try:
+                        img = RLImage(img_source)
                         ratio = img.imageHeight / float(img.imageWidth)
                         img.drawWidth = 4.5 * cm
                         img.drawHeight = min(4.5 * cm * ratio, 6 * cm)
@@ -1539,6 +2652,21 @@ class KrishnaIntelligence(ctk.CTk):
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
             ]))
             story.append(table)
+
+            matches = self._cross_video_matches()
+            if matches:
+                story.append(Spacer(1, 10))
+                story.append(Paragraph("<b>Possible cross-video matches "
+                                       "(heuristic, verify manually):</b>", small))
+                for m in matches:
+                    story.append(Paragraph(f"- {m}", small))
+
+            story.append(Spacer(1, 12))
+            story.append(Paragraph(
+                f"<b>Digitally verified by:</b> {operator} &nbsp;&nbsp; "
+                f"<b>Verification Code:</b> {self._report_verification_code()}",
+                small))
+
             doc.build(story)
             return True, ""
         except Exception as exc:
@@ -1555,6 +2683,291 @@ class KrishnaIntelligence(ctk.CTk):
             w.destroy()
         self.gallery_widgets.clear()
 
+    def _safe_remove(self, path):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def print_last_report(self):
+        """Print the current in-memory report via a temp PDF that is
+        deleted right after handoff — no persistent local report copy,
+        consistent with the 'reports live only on the web panel' rule."""
+        if not self.evidence_database:
+            messagebox.showwarning("No Report", "No evidence captured yet to print.")
+            return
+        tmp_path = os.path.join(tempfile.gettempdir(),
+                                f"krishna_print_{int(time.time())}.pdf")
+        ok, err = self._build_pdf(tmp_path)
+        if not ok:
+            messagebox.showerror("Print Failed", f"Could not build report:\n{err}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(tmp_path, "print")
+            else:
+                subprocess.Popen(["lp", tmp_path])
+            messagebox.showinfo("Printing", "Report sent to the printer.")
+        except Exception as exc:
+            messagebox.showerror("Print Failed", f"Could not print:\n{exc}")
+        finally:
+            self.after(15000, lambda: self._safe_remove(tmp_path))
+
+    def _ensure_case(self):
+        """Make sure a case folder exists, prompting for a Case ID if the
+        operator wants to add evidence before starting a video scan."""
+        if self.current_case_dir:
+            return True
+        case_id = simpledialog.askstring("Case ID", "Enter Case ID:", parent=self)
+        if not case_id:
+            return False
+        case_id = "".join(c if c.isalnum() or c in "-_ " else "_"
+                          for c in case_id.strip())
+        self.current_case_id = case_id
+        self.current_case_dir = os.path.join(self.base_dir, "Cases", case_id)
+        os.makedirs(self.current_case_dir, exist_ok=True)
+        self._add_recent_case(case_id)
+        self.case_entry.delete(0, tk.END)
+        self.case_entry.insert(0, case_id)
+        return True
+
+    def add_manual_evidence(self):
+        if not self._ensure_case():
+            return
+        path = filedialog.askopenfilename(
+            title="Select Evidence Photo",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png")])
+        if not path:
+            return
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Could not open image:\n{exc}")
+            return
+        cat = simpledialog.askstring(
+            "Evidence Type",
+            "Type (Person/Car/Motorcycle/Bus/Truck/Other):",
+            initialvalue="Person", parent=self)
+        if not cat:
+            return
+        manual_dir = os.path.join(self.current_case_dir, "Manual")
+        os.makedirs(manual_dir, exist_ok=True)
+        ts = datetime.now().strftime("%H%M%S")
+        filename = f"MANUAL_{cat}_{ts}.jpg"
+        filepath = os.path.join(manual_dir, filename)
+        img.save(filepath, "JPEG")
+        crop_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        color = self.detect_color(crop_bgr)
+        entry = {
+            "filename": filename, "type": cat, "track_id": "MANUAL",
+            "color": color, "timestamp": ts, "video": "Manual Entry",
+            "filepath": os.path.abspath(filepath),
+            "source_path": "", "frame_idx": 0,
+            "note": "", "starred": False, "encrypted": False,
+            "upper_color": "", "lower_color": "", "direction": "",
+            "speed_px_s": 0, "face_match": "", "plate_text": "",
+        }
+        self.evidence_database.append(entry)
+        self.gui_queue.put(("evidence", img, entry))
+        self.gui_queue.put(("stats_update", None))
+        self.gui_queue.put(("timeline",
+                            f"➕ Manual evidence added: {cat} ({filename})\n"))
+
+    def bulk_export_zip(self):
+        if not self.current_case_dir or not os.path.isdir(self.current_case_dir):
+            messagebox.showwarning("No Case", "No case evidence to export yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".zip", filetypes=[("ZIP Archive", "*.zip")],
+            initialfile=f"{self.current_case_id or 'case'}_evidence.zip")
+        if not path:
+            return
+        try:
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(self.current_case_dir):
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        arcname = os.path.relpath(fpath, self.current_case_dir)
+                        zf.write(fpath, arcname)
+            messagebox.showinfo("Exported", f"Evidence photos zipped to:\n{path}")
+        except OSError as exc:
+            messagebox.showerror("Export Failed", f"Could not create ZIP:\n{exc}")
+
+    def _view_evidence(self, entry):
+        path = entry.get("filepath", "")
+        try:
+            if entry.get("encrypted"):
+                if not HAS_CRYPTO:
+                    messagebox.showerror(
+                        "Unavailable",
+                        "This evidence is encrypted but the 'cryptography' "
+                        "package is not installed on this PC.")
+                    return
+                with open(path, "rb") as f:
+                    token = f.read()
+                raw = self._fernet().decrypt(token)
+                img = Image.open(io.BytesIO(raw))
+            else:
+                img = Image.open(path)
+            self._show_zoom_viewer(img, entry)
+        except Exception as exc:
+            messagebox.showerror("View Failed", f"Could not open evidence:\n{exc}")
+
+    def _show_zoom_viewer(self, pil_img, entry):
+        win = ctk.CTkToplevel(self)
+        win.title(f"Evidence — ID {entry.get('track_id', '-')}")
+        win.configure(fg_color=BG_DARK)
+        w, h = pil_img.size
+        scale = min(900 / w, 700 / h, 3.0)
+        disp = pil_img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        img_ctk = ctk.CTkImage(disp, size=disp.size)
+        ctk.CTkLabel(win, image=img_ctk, text="").pack(padx=10, pady=10)
+
+        info = (f"ID {entry.get('track_id', '-')} | {entry.get('type', '-')} | "
+               f"{entry.get('color', '-')}\n"
+               f"{str(entry.get('timestamp', '')).replace('_', ' ')} | "
+               f"{entry.get('video', '-')}")
+        if entry.get("upper_color") or entry.get("lower_color"):
+            info += (f"\nClothing: {entry.get('upper_color', '-')} (top) / "
+                     f"{entry.get('lower_color', '-')} (bottom)")
+        if entry.get("direction"):
+            info += (f"\nDirection: {entry['direction']} | Speed(approx): "
+                     f"{entry.get('speed_px_s', 0)} px/s")
+        if entry.get("face_match"):
+            info += f"\n⚠ Possible Match: {entry['face_match']}"
+        if entry.get("plate_text"):
+            info += f"\nPlate (OCR, approx): {entry['plate_text']}"
+        if entry.get("note"):
+            info += f"\nNote: {entry['note']}"
+        ctk.CTkLabel(win, text=info, font=("Courier", 11), justify="left",
+                     text_color=ACCENT).pack(padx=10, pady=(0, 10))
+
+        if entry.get("source_path"):
+            ctk.CTkButton(win, text="🎬 Export ±5s Clip", height=32,
+                         fg_color=PURPLE, hover_color="#7C3AED",
+                         command=lambda e=entry: self._export_clip(e)
+                         ).pack(padx=10, pady=(0, 10), fill="x")
+
+    def _toggle_star(self, entry, card):
+        entry["starred"] = not entry.get("starred", False)
+        card._star_btn.configure(
+            text="★" if entry["starred"] else "☆",
+            fg_color=GOLD if entry["starred"] else PANEL_BG,
+            text_color=BG_DARK if entry["starred"] else "white")
+
+    def _edit_note(self, entry):
+        note = simpledialog.askstring(
+            "Evidence Note", "Add/edit note for this evidence:",
+            initialvalue=entry.get("note", ""), parent=self)
+        if note is not None:
+            entry["note"] = note.strip()
+
+    def _delete_evidence(self, entry, card):
+        if not messagebox.askyesno(
+                "Delete Evidence",
+                f"Remove ID {entry.get('track_id')} ({entry.get('type')}) "
+                "from this case's evidence list?\n"
+                "(The saved photo file will also be deleted.)"):
+            return
+        try:
+            fp = entry.get("filepath")
+            if fp and os.path.exists(fp):
+                os.remove(fp)
+        except OSError as exc:
+            log.warning("Could not delete evidence file: %s", exc)
+        if entry in self.evidence_database:
+            self.evidence_database.remove(entry)
+        if entry.get("type") == "Person":
+            self.stats["persons"] = max(0, self.stats.get("persons", 0) - 1)
+        elif entry.get("type") in self.VEHICLES:
+            self.stats["vehicles"] = max(0, self.stats.get("vehicles", 0) - 1)
+        card.destroy()
+        if card in self.gallery_widgets:
+            self.gallery_widgets.remove(card)
+        self.evidence_count.configure(
+            text=f"📸 Total Evidence: {len(self.evidence_database)}")
+        self.person_count.configure(text=f"👤 P: {self.stats.get('persons', 0)}")
+        self.vehicle_count.configure(text=f"🚗 V: {self.stats.get('vehicles', 0)}")
+
+    def _filter_gallery(self, event=None):
+        q = self.search_entry.get().strip().lower()
+        for card in self.gallery_widgets:
+            entry = getattr(card, "_entry", {})
+            haystack = " ".join(str(v) for v in entry.values()).lower()
+            if not q or q in haystack:
+                card.pack(pady=5, padx=5, fill="x")
+            else:
+                card.pack_forget()
+
+    def _export_clip(self, entry):
+        src = entry.get("source_path")
+        if not src or not os.path.exists(src):
+            messagebox.showwarning(
+                "Unavailable",
+                "Original video file not found (moved or deleted?).")
+            return
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".mp4", filetypes=[("MP4 Video", "*.mp4")],
+            initialfile=f"clip_ID{entry['track_id']}_{entry['timestamp']}.mp4")
+        if not save_path:
+            return
+        try:
+            cap = cv2.VideoCapture(src)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            center_frame = entry.get("frame_idx", 0)
+            start_f = max(0, center_frame - int(fps * 5))
+            end_f = center_frame + int(fps * 5)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(save_path, fourcc, fps, (w, h))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
+            f = start_f
+            while f <= end_f:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                out.write(frame)
+                f += 1
+            cap.release()
+            out.release()
+            messagebox.showinfo("Clip Saved", f"Clip saved:\n{save_path}")
+        except Exception as exc:
+            messagebox.showerror("Clip Failed", f"Could not create clip:\n{exc}")
+
+    def show_analytics(self):
+        win = ctk.CTkToplevel(self)
+        win.title("📊 Analytics Dashboard")
+        win.geometry("520x420")
+        win.configure(fg_color=BG_DARK)
+        counts = defaultdict(int)
+        for e in self.evidence_database:
+            counts[e["type"]] += 1
+        canvas = tk.Canvas(win, width=480, height=260, bg=BG_DARK,
+                           highlightthickness=0)
+        canvas.pack(pady=15)
+        if not counts:
+            canvas.create_text(240, 130, text="No evidence yet in this case.",
+                               fill="gray", font=("Arial", 13))
+        else:
+            max_v = max(counts.values())
+            bar_w = 480 // max(1, len(counts))
+            colors_cycle = [HIGHLIGHT, ACCENT, SUCCESS, PURPLE, GOLD, WARNING]
+            for i, (k, v) in enumerate(sorted(counts.items())):
+                bh = int((v / max_v) * 200)
+                x0 = i * bar_w + 15
+                canvas.create_rectangle(x0, 230 - bh, x0 + bar_w - 25, 230,
+                                        fill=colors_cycle[i % len(colors_cycle)])
+                canvas.create_text(x0 + (bar_w - 25) // 2, 245, text=k,
+                                   fill="white", font=("Arial", 10))
+                canvas.create_text(x0 + (bar_w - 25) // 2, 220 - bh, text=str(v),
+                                   fill="white", font=("Arial", 11, "bold"))
+        ctk.CTkLabel(win,
+                    text=f"Total Evidence: {len(self.evidence_database)}  |  "
+                         f"Max Crowd Seen: {self.stats.get('max_crowd', 0)}",
+                    font=("Arial", 12, "bold"), text_color=GOLD).pack(pady=5)
+
     # ---------------------------------------------------------- GUI queue --
     def process_queue(self):
         try:
@@ -1569,7 +2982,7 @@ class KrishnaIntelligence(ctk.CTk):
                     self.video_label.configure(image=img_ctk, text="")
 
                 elif kind == "evidence":
-                    pil_img, cat, color, ts, tid, path = msg[1:7]
+                    pil_img, entry = msg[1], msg[2]
                     thumb = pil_img.copy()
                     thumb.thumbnail((220, 130))
                     img_ctk = ctk.CTkImage(thumb, size=thumb.size)
@@ -1577,14 +2990,45 @@ class KrishnaIntelligence(ctk.CTk):
                     card = ctk.CTkFrame(self.gallery, fg_color=BG_DARK,
                                         corner_radius=8)
                     card.pack(pady=5, padx=5, fill="x")
+                    card._entry = entry
                     ctk.CTkButton(card, image=img_ctk, text="",
                                   fg_color="transparent",
-                                  command=lambda p=path: open_path(p)
+                                  command=lambda e=entry: self._view_evidence(e)
                                   ).pack(pady=5)
-                    ctk.CTkLabel(card,
-                                 text=f"ID:{tid} | {cat} | {color}\n{ts}",
-                                 font=("Courier", 10, "bold"),
-                                 text_color=HIGHLIGHT).pack(pady=(0, 5))
+                    label_text = (f"ID:{entry['track_id']} | {entry['type']} | "
+                                 f"{entry['color']}\n{entry['timestamp']}")
+                    if entry.get("face_match"):
+                        label_text += f"\n⚠ {entry['face_match']}"
+                    if entry.get("encrypted"):
+                        label_text += "  🔒"
+                    ctk.CTkLabel(card, text=label_text,
+                                font=("Courier", 10, "bold"),
+                                text_color=HIGHLIGHT).pack(pady=(0, 3))
+
+                    btn_row = ctk.CTkFrame(card, fg_color="transparent")
+                    btn_row.pack(pady=(0, 5))
+                    star_btn = ctk.CTkButton(
+                        btn_row, text="★" if entry.get("starred") else "☆",
+                        width=28, height=24,
+                        fg_color=GOLD if entry.get("starred") else PANEL_BG,
+                        command=lambda e=entry, c=card: self._toggle_star(e, c))
+                    star_btn.pack(side="left", padx=2)
+                    card._star_btn = star_btn
+                    ctk.CTkButton(btn_row, text="📝", width=28, height=24,
+                                 fg_color=PANEL_BG,
+                                 command=lambda e=entry: self._edit_note(e)
+                                 ).pack(side="left", padx=2)
+                    if entry.get("source_path"):
+                        ctk.CTkButton(btn_row, text="🎬", width=28, height=24,
+                                     fg_color=PANEL_BG,
+                                     command=lambda e=entry: self._export_clip(e)
+                                     ).pack(side="left", padx=2)
+                    ctk.CTkButton(btn_row, text="🗑", width=28, height=24,
+                                 fg_color="#7F1D1D",
+                                 command=lambda e=entry, c=card:
+                                 self._delete_evidence(e, c)
+                                 ).pack(side="left", padx=2)
+
                     self.gallery_widgets.append(card)
                     if len(self.gallery_widgets) > self.max_gallery_items:
                         self.gallery_widgets.pop(0).destroy()
@@ -1614,6 +3058,7 @@ class KrishnaIntelligence(ctk.CTk):
                 elif kind == "video_done":
                     if self.is_scanning:
                         self.current_video_idx += 1
+                        self._save_resume_state()
                         self.process_next_video()
 
                 elif kind == "upload_result":
@@ -1645,7 +3090,8 @@ class KrishnaIntelligence(ctk.CTk):
                 elif kind == "model_ready":
                     self.hw_label.configure(
                         text=f"HARDWARE: {self.device.upper()}",
-                        text_color=ACCENT if self.device == "cuda" else WARNING)
+                        text_color=ACCENT if self.device.startswith("cuda")
+                        else WARNING)
                     if not self.is_scanning:
                         self.lbl_status.configure(text="✅ System Ready",
                                                   text_color=SUCCESS)
@@ -1653,6 +3099,23 @@ class KrishnaIntelligence(ctk.CTk):
                 elif kind == "model_failed":
                     self.hw_label.configure(text="HARDWARE: MODEL FAILED",
                                             text_color=DANGER)
+
+                elif kind == "gpu_info":
+                    count = msg[1]
+                    if count > 1:
+                        values = [str(i) for i in range(count)]
+                        self.gpu_combo.configure(values=values, state="normal")
+                        self.gpu_combo.set(str(self.settings.get("gpu_index", 0)))
+                    else:
+                        self.gpu_combo.configure(values=["CPU/GPU0"],
+                                                 state="disabled")
+                        self.gpu_combo.set("CPU/GPU0")
+
+                elif kind == "benchmark_done":
+                    self.lbl_performance.configure(text=f"⚡ Benchmark: {msg[1]}")
+                    self.timeline_text.insert(
+                        tk.END, f"⚡ Hardware benchmark: {msg[1]}\n")
+                    self.timeline_text.see(tk.END)
 
         except queue.Empty:
             pass

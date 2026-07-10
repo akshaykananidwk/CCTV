@@ -8,6 +8,11 @@ build/
 dist/
 *.spec
 client_config.json
+app_settings.json
+resume_state.json
+recent_cases.json
+Known_Suspects/
+fonts/
 server/data/*.db
 server/data/*.db-*
 server/data/reports/

@@ -1,6 +1,6 @@
 # 🦚 Krishna Intelligence
 
-**Forensic CCTV Video Analysis Suite** — `v14.0 Pro Enterprise`
+**Forensic CCTV Video Analysis Suite** — `v16.0 Pro Enterprise`
 
 AI-powered desktop software + web panel. The software scans CCTV footage in
 batches, detects and tracks persons / vehicles / animals with YOLOv8, captures
@@ -28,6 +28,50 @@ link on WhatsApp.
   **WhatsApp message with the view link** goes to the operator. **No local
   report files** — internet ન હોય તો report ક્યાંય ન મળે; એ hidden queue માં
   રહે અને internet આવે એટલે આપોઆપ (કે SYNC button થી) upload થાય.
+
+### 🕵️ Investigation Tools (v16 — new)
+- 👕 **Clothing color split** (upper/lower) for every Person evidence
+- 🧭 **Direction of movement** + **approximate relative speed** (px/s,
+  uncalibrated — not a real km/h reading)
+- ⚠ **Loitering alerts** and **crowd alerts** (thresholds adjustable)
+- 🔗 **Cross-video match suggestions** — flags same type+color seen in more
+  than one video of the same case (heuristic lead, not identity proof)
+- 🧑 **Face recognition** against a local `Known_Suspects/<name>/*.jpg`
+  folder (needs `opencv-contrib-python`; train from the sidebar button)
+- 🙈 **Blur faces** in saved evidence, 💧 **watermark** evidence photos
+- 🔢 **Number-plate OCR** and 🕐 **CCTV overlay-timestamp OCR** (both need
+  `pytesseract` + the separate Tesseract-OCR program)
+- 🔒 **Encrypt evidence on disk** (needs `pip install cryptography`) — the
+  live gallery still shows photos during the session; only the saved file
+  is protected once the app closes
+- ➕ **Manual evidence add**, ⭐ star, 📝 note, 🗑 delete, 🔍 search, 📦 ZIP
+  export, 🎬 **±5s clip export** from the original video, 🔍 in-app zoom
+  viewer (works for encrypted evidence too)
+- 📋 **Case status/notes/templates**, 📁 **recent cases** (reload evidence
+  photos for review), 🆚 **compare two cases** (heuristic)
+- 📊 **Analytics dashboard**, 🖨 **print report** (temp file only — no
+  report is ever left on the PC, matching the "reports only online" rule)
+- 🎚 **Model size / GPU selector + reload**, ⚡ **auto hardware benchmark**,
+  ▶ **resume an interrupted scan** after a crash or power cut
+- 🔐 **Auto-lock** after N idle minutes (off by default) — unlock re-checks
+  the password against the server
+- ✅ **PDF verification code** (SHA-256-based, not a legal digital
+  signature) + operator/designation stamp on every report; **SHA-256 hash**
+  of every source video stored in the report for evidentiary integrity
+
+**Not implemented / intentionally deferred** (so nothing is oversold):
+weapon detection (no reliable free model exists), age/gender estimation
+(needs pretrained model files not bundled), true multi-camera face re-ID
+across separate cameras (only the same-case heuristic above exists), live
+RTSP camera feed, multi-video split-screen scanning, true parallel
+multi-video GPU processing (a single shared YOLO tracker isn't safe for
+that), Excel export of the report (would create a local report copy,
+against the "internet-only reports" rule), a QR code linking straight to
+the live report URL (needs a small server change), and full Gujarati PDF
+text (works only if you supply `fonts/NotoSansGujarati-Regular.ttf`
+yourself — the code path is ready, the font file is not bundled). Full
+light-theme colors and app-wide font scaling are partially wired (setting
++ toggle exist) but not yet applied to every existing widget.
 
 ### 🌐 Web Panel (`server/` — PHP + SQLite)
 - 👥 **Admin panel** (`admin/`) — create users (name, office/police station,
@@ -108,6 +152,19 @@ Krishna_Forensic_Data/
 | GPU | Optional — NVIDIA હોય તો આપોઆપ વપરાય |
 | Server | PHP 8.0+, SQLite (કોઈ પણ cPanel hosting) |
 | Internet | ફરજિયાત (login + report upload) |
+
+### 🔧 Optional features — વધારાનું install
+
+| Feature | જરૂરી |
+|---|---|
+| Face Recognition, Blur Faces | `pip install opencv-contrib-python` (already in requirements.txt, replaces plain opencv-python) |
+| Number Plate OCR, Overlay Timestamp OCR | `pip install pytesseract` **+** [Tesseract-OCR](https://github.com/UB-Mannheim/tesseract/wiki) installed separately on Windows |
+| Encrypt Evidence on Disk | `pip install cryptography` |
+| Corrupt-video auto-repair | [ffmpeg](https://ffmpeg.org/download.html) installed and on PATH |
+| Gujarati text in PDF | place a Unicode font at `fonts/NotoSansGujarati-Regular.ttf` |
+
+જે feature નું package install ન હોય એનો switch app માં આપોઆપ disabled (ગ્રે) દેખાશે —
+બાકીનું સોફ્ટવેર સામાન્ય રીતે જ ચાલશે.
 
 ## 🛠 Troubleshooting
 

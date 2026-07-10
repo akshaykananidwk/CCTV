@@ -1,8 +1,20 @@
 customtkinter>=5.2.0
 pillow>=10.0.0
-opencv-python>=4.8.0
+# opencv-contrib-python is a superset of opencv-python (adds cv2.face for
+# Face Recognition) — install ONLY this one, never both (they conflict).
+# Pinned below major version 5: OpenCV 5.x (released on PyPI) ships a
+# CascadeClassifier-less build in some configurations, which would
+# silently disable face-blur/face-recognition. Stay on the well-tested
+# 4.x line until 5.x is verified.
+opencv-contrib-python>=4.8.0,<5
 numpy>=1.24.0
 ultralytics>=8.1.0
 lapx>=0.5.5
 reportlab>=4.0.0
 requests>=2.31.0
+
+# ---- optional, for extra features (safe to skip; app degrades gracefully) ----
+# pytesseract>=0.3.10      # Number Plate OCR / CCTV overlay timestamp OCR
+#                          # ALSO needs the Tesseract-OCR program installed
+#                          # separately: https://github.com/UB-Mannheim/tesseract/wiki
+# cryptography>=42.0.0     # Encrypt Evidence on Disk toggle
