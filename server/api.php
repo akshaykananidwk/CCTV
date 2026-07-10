@@ -147,7 +147,22 @@ if ($action === 'upload_report') {
         mkdir($dir, 0775, true);
     }
 
-    $viewToken = rand_token(24);
+    // The client may pre-generate its own token so the QR code it already
+    // baked into the PDF matches the final view URL. Use it only if it
+    // looks right and is not already taken; otherwise fall back to a
+    // server-generated one (older client versions, or a collision).
+    $clientToken = preg_replace('/[^a-f0-9]/', '', $_POST['client_token'] ?? '');
+    $viewToken = null;
+    if (strlen($clientToken) === 48) {
+        $chk = $pdo->prepare("SELECT id FROM reports WHERE view_token = ?");
+        $chk->execute([$clientToken]);
+        if (!$chk->fetch()) {
+            $viewToken = $clientToken;
+        }
+    }
+    if ($viewToken === null) {
+        $viewToken = rand_token(24);
+    }
     $pdfFile = null;
     $jsonFile = null;
 

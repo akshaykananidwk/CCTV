@@ -58,6 +58,7 @@ import hashlib
 import io
 import math
 import re
+import secrets
 import zipfile
 import tempfile
 from datetime import datetime, timedelta
@@ -81,8 +82,14 @@ try:
 except BaseException:  # noqa: broad — see reasoning above
     HAS_CRYPTO = False
 
+try:
+    import qrcode
+    HAS_QRCODE = True
+except BaseException:  # noqa: broad — see reasoning above
+    HAS_QRCODE = False
+
 APP_NAME = "Krishna Intelligence"
-APP_VERSION = "v16.0 Pro Enterprise"
+APP_VERSION = "v17.0 Pro Enterprise"
 
 CLIENT_CONFIG_FILE = "client_config.json"
 SETTINGS_FILE = "app_settings.json"
@@ -103,12 +110,50 @@ DEFAULT_SETTINGS = {
     "crowd_alert": 8,
 }
 
+
+def load_settings():
+    """Local (per-PC) app preferences — separate from the server profile."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data)
+        return merged
+    except (OSError, ValueError):
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except OSError as exc:
+        log.warning("Could not save settings: %s", exc)
+
+
 # ---------------------------------------------------------------- appearance
-ctk.set_appearance_mode("dark")
+# Full dark/light palette. Picked once at startup from the saved setting —
+# toggling the theme takes effect after a restart (rebuilding ~150 already-
+# created widgets live is not worth the risk of a half-migrated UI).
+_PALETTES = {
+    "dark": dict(BG_DARK="#0A0E1A", PANEL_BG="#111827", CARD_BG="#0A0E1A",
+                TEXT_MAIN="#E5E7EB", TEXT_MUTED="gray"),
+    "light": dict(BG_DARK="#F1F5F9", PANEL_BG="#FFFFFF", CARD_BG="#E2E8F0",
+                 TEXT_MAIN="#0F172A", TEXT_MUTED="#475569"),
+}
+_initial_settings = load_settings()
+_theme_name = _initial_settings.get("theme", "dark")
+if _theme_name not in _PALETTES:
+    _theme_name = "dark"
+ctk.set_appearance_mode(_theme_name)
 ctk.set_default_color_theme("blue")
 
-BG_DARK = "#0A0E1A"
-PANEL_BG = "#111827"
+_palette = _PALETTES[_theme_name]
+BG_DARK = _palette["BG_DARK"]
+PANEL_BG = _palette["PANEL_BG"]
+CARD_BG = _palette["CARD_BG"]
+TEXT_MAIN = _palette["TEXT_MAIN"]
+TEXT_MUTED = _palette["TEXT_MUTED"]
 HIGHLIGHT = "#F97316"
 ACCENT = "#06B6D4"
 DANGER = "#EF4444"
@@ -140,26 +185,6 @@ def open_path(path):
             subprocess.Popen(["xdg-open", path])
     except Exception as exc:
         log.warning("Could not open %s: %s", path, exc)
-
-
-def load_settings():
-    """Local (per-PC) app preferences — separate from the server profile."""
-    try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        merged = dict(DEFAULT_SETTINGS)
-        merged.update(data)
-        return merged
-    except (OSError, ValueError):
-        return dict(DEFAULT_SETTINGS)
-
-
-def save_settings(settings):
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
-    except OSError as exc:
-        log.warning("Could not save settings: %s", exc)
 
 
 def sha256_file(path, chunk_size=1024 * 1024):
@@ -344,8 +369,12 @@ class AuthClient:
             return True, "Password changed."
         return False, out.get("error", "Reset failed.")
 
-    def upload_report(self, case_id, pdf_path, json_path, stats):
-        """Upload the case report (PDF + JSON only). Returns (ok, link_or_error)."""
+    def upload_report(self, case_id, pdf_path, json_path, stats, client_token=""):
+        """Upload the case report (PDF + JSON only). Returns (ok, link_or_error).
+
+        `client_token`, if given, becomes the report's view token on the
+        server — this lets the PDF's own QR code (built before upload)
+        point at the exact URL the report ends up living at."""
         if not self.token:
             return False, "Not logged in."
         try:
@@ -360,13 +389,17 @@ class AuthClient:
             if not files:
                 return False, "No report files to upload."
             try:
-                out = self._post("upload_report", {
+                payload = {
                     "token": self.token,
                     "case_id": case_id,
                     "persons": stats.get("persons", 0),
                     "vehicles": stats.get("vehicles", 0),
                     "total": stats.get("total", 0),
-                }, files=files, timeout=120)
+                }
+                if client_token:
+                    payload["client_token"] = client_token
+                out = self._post("upload_report", payload,
+                                 files=files, timeout=120)
             finally:
                 for fh in handles:
                     fh.close()
@@ -1125,6 +1158,17 @@ class KrishnaIntelligence(ctk.CTk):
             command=self.import_videos)
         self.btn_import.pack(fill="x", pady=5)
 
+        live_row = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        live_row.pack(pady=(0, 5), padx=10, fill="x")
+        ctk.CTkButton(live_row, text="📡 Add Live Camera (RTSP/HTTP)",
+                     font=("Arial", 10), height=32, fg_color="#374151",
+                     command=self.add_live_camera
+                     ).pack(side="left", expand=True, fill="x", padx=(0, 2))
+        ctk.CTkButton(live_row, text="👁 Preview 2x/4x", font=("Arial", 10),
+                     height=32, fg_color="#374151",
+                     command=self.preview_video
+                     ).pack(side="left", expand=True, fill="x", padx=(2, 0))
+
         ctrl = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         ctrl.pack(pady=5, padx=10, fill="x")
         self.btn_start = ctk.CTkButton(
@@ -1308,7 +1352,7 @@ class KrishnaIntelligence(ctk.CTk):
         ctk.CTkButton(lock_row, text="Save", width=45, height=24,
                      command=self._save_autolock).pack(side="left", padx=(6, 0))
 
-        ctk.CTkButton(self.sidebar, text="🌓 Toggle Theme (partial)",
+        ctk.CTkButton(self.sidebar, text="🌓 Toggle Dark/Light Theme",
                      font=("Arial", 10), fg_color="#374151", height=32,
                      command=self.toggle_theme).pack(pady=(0, 5), padx=10, fill="x")
 
@@ -1322,6 +1366,10 @@ class KrishnaIntelligence(ctk.CTk):
                       font=("Arial", 11, "bold"), fg_color="#34495E",
                       hover_color=ACCENT, height=40,
                       command=self.open_folder).pack(pady=5, padx=10, fill="x")
+        ctk.CTkButton(self.sidebar, text="❓ HELP / ABOUT",
+                      font=("Arial", 11, "bold"), fg_color="#34495E",
+                      hover_color=ACCENT, height=36,
+                      command=self.show_help).pack(pady=(0, 5), padx=10, fill="x")
         ctk.CTkButton(self.sidebar, text="🚪 LOGOUT",
                       font=("Arial", 11, "bold"), fg_color="#7F1D1D",
                       hover_color=DANGER, height=36,
@@ -1461,13 +1509,14 @@ class KrishnaIntelligence(ctk.CTk):
         new_theme = "light" if self.settings.get("theme", "dark") == "dark" else "dark"
         self.settings["theme"] = new_theme
         save_settings(self.settings)
-        ctk.set_appearance_mode(new_theme)
-        messagebox.showinfo(
-            "Theme Changed",
-            "Appearance mode updated.\nNote: this UI uses a fixed dark "
-            "color palette for CCTV/low-light viewing comfort, so panel "
-            "colors will not fully invert — a full light theme needs a "
-            "larger redesign.")
+        if messagebox.askyesno(
+                "Theme Changed",
+                f"Switched to {new_theme.upper()} theme.\n"
+                "Krishna Intelligence needs to restart to apply the full "
+                "color palette.\n\nRestart now?"):
+            self.destroy()
+            python = sys.executable
+            os.execl(python, python, os.path.abspath(__file__))
 
     def _save_autolock(self):
         self.settings["autolock_minutes"] = self._safe_int(
@@ -1546,6 +1595,113 @@ class KrishnaIntelligence(ctk.CTk):
                 text=f"✅ {len(files)} FILES LOADED\nReady for Analysis",
                 text_color=SUCCESS)
             self.lbl_status.configure(text="Ready to Scan", text_color=SUCCESS)
+
+    @staticmethod
+    def _is_stream_url(source):
+        return isinstance(source, str) and source.lower().startswith(
+            ("rtsp://", "rtsps://", "http://", "https://"))
+
+    def add_live_camera(self):
+        url = simpledialog.askstring(
+            "Add Live Camera",
+            "Enter the RTSP/HTTP camera URL\n"
+            "e.g. rtsp://user:pass@192.168.1.10:554/stream1\n\n"
+            "Not tested against real camera hardware in development — "
+            "please verify with your own CCTV/IP camera and report any "
+            "issue.", parent=self)
+        if not url:
+            return
+        url = url.strip()
+        if not self._is_stream_url(url):
+            messagebox.showwarning(
+                "Invalid URL", "URL must start with rtsp://, rtsps://, "
+                               "http:// or https://")
+            return
+        self.video_list.append(url)
+        self.batch_label.configure(text=f"Queue: {len(self.video_list)} sources "
+                                        f"(incl. live camera)")
+        self.video_label.configure(
+            text=f"✅ {len(self.video_list)} SOURCE(S) LOADED\n"
+                 "Ready for Analysis", text_color=SUCCESS)
+        self.lbl_status.configure(text="Ready to Scan", text_color=SUCCESS)
+        messagebox.showinfo(
+            "Live Camera Added",
+            "Live camera added to the queue.\n"
+            "⚠ A live feed has no natural end — press ⏹ ABORT when you "
+            "want to stop scanning it.")
+
+    def preview_video(self):
+        """Quick 2x/4x skim of a video BEFORE running the full AI scan —
+        no detection, just a fast visual look at the footage."""
+        path = filedialog.askopenfilename(
+            title="Select a Video to Preview",
+            filetypes=[("Video Files", "*.mp4 *.avi *.mkv *.mov *.wmv "
+                                       "*.dav *.h264 *.ts *.mts *.m4v "
+                                       "*.flv *.3gp *.asf")])
+        if not path:
+            return
+        speed = simpledialog.askstring(
+            "Preview Speed", "Playback speed multiplier (2 or 4):",
+            initialvalue="2", parent=self)
+        try:
+            speed = max(1, int(speed))
+        except (TypeError, ValueError):
+            speed = 2
+        self._preview_stop = False
+        win = ctk.CTkToplevel(self)
+        win.title(f"Preview ({speed}x) — {os.path.basename(path)}")
+        win.configure(fg_color=BG_DARK)
+        lbl = ctk.CTkLabel(win, text="Loading...", font=("Courier", 14))
+        lbl.pack(padx=10, pady=10)
+        ctk.CTkButton(win, text="⏹ Close Preview", fg_color=DANGER,
+                     command=lambda: setattr(self, "_preview_stop", True)
+                     ).pack(pady=(0, 10))
+        win.protocol("WM_DELETE_WINDOW",
+                    lambda: (setattr(self, "_preview_stop", True), win.destroy()))
+
+        def worker():
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                self.after(0, lambda: messagebox.showerror(
+                    "Error", "Could not open video for preview."))
+                self.after(0, win.destroy)
+                return
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            frame_delay = 1.0 / (fps if fps > 0 else 25.0)
+            frame_idx = 0
+            while not self._preview_stop:
+                t0 = time.time()
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_idx % speed == 0:
+                    disp_w, disp_h = self.display_size
+                    h, w = frame.shape[:2]
+                    scale = min(disp_w / w, disp_h / h, 1.0)
+                    new_size = (max(2, int(w * scale)), max(2, int(h * scale)))
+                    rgb = cv2.cvtColor(cv2.resize(frame, new_size),
+                                       cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(rgb)
+
+                    def update(img=pil_img, size=new_size):
+                        if self._preview_stop or not win.winfo_exists():
+                            return
+                        img_ctk = ctk.CTkImage(img, size=size)
+                        lbl.configure(image=img_ctk, text="")
+                        lbl.image = img_ctk
+
+                    self.after(0, update)
+                    # Show playback at roughly `speed`x real time (only the
+                    # displayed frames incur the sleep, skipped ones don't).
+                    elapsed = time.time() - t0
+                    remaining = frame_delay - elapsed
+                    if remaining > 0:
+                        time.sleep(remaining)
+                frame_idx += 1
+            cap.release()
+            self.after(0, lambda: win.winfo_exists() and win.destroy())
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def toggle_pause(self):
         if not self.is_scanning:
@@ -1905,14 +2061,21 @@ class KrishnaIntelligence(ctk.CTk):
             return ""
 
     def _run_video(self, video_path, config):
-        vid_name = os.path.splitext(os.path.basename(video_path))[0]
+        is_stream = self._is_stream_url(video_path)
+        if is_stream:
+            vid_name = "LIVE_" + re.sub(r"[^A-Za-z0-9]+", "_",
+                                        video_path)[:40].strip("_")
+        else:
+            vid_name = os.path.splitext(os.path.basename(video_path))[0]
+        vid_name = "".join(c if c.isalnum() or c in "-_ " else "_"
+                           for c in vid_name) or "video"
         output_dir = os.path.join(self.current_case_dir, vid_name)
         os.makedirs(output_dir, exist_ok=True)
         self._current_video_path = video_path
 
         repaired_tmp = None
         cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
+        if not cap.isOpened() and not is_stream:
             repaired_tmp = self._try_ffmpeg_repair(video_path)
             if repaired_tmp:
                 cap = cv2.VideoCapture(repaired_tmp)
@@ -1920,22 +2083,27 @@ class KrishnaIntelligence(ctk.CTk):
                     ("video_error",
                      f"🔧 Repaired and reopened corrupt video: "
                      f"{os.path.basename(video_path)}\n"))
-            if not cap.isOpened():
-                self.gui_queue.put(
-                    ("video_error",
-                     f"⚠ Could not open video: {os.path.basename(video_path)}\n"))
-                if repaired_tmp and os.path.exists(repaired_tmp):
-                    try:
-                        os.remove(repaired_tmp)
-                    except OSError:
-                        pass
-                return
+        if not cap.isOpened():
+            self.gui_queue.put(
+                ("video_error",
+                 f"⚠ Could not open "
+                 f"{'live camera' if is_stream else 'video'}: "
+                 f"{video_path if is_stream else os.path.basename(video_path)}\n"))
+            if repaired_tmp and os.path.exists(repaired_tmp):
+                try:
+                    os.remove(repaired_tmp)
+                except OSError:
+                    pass
+            return
 
-        try:
-            self.video_hashes[vid_name] = sha256_file(video_path)
-        except OSError as exc:
-            log.warning("Could not hash video %s: %s", video_path, exc)
-            self.video_hashes[vid_name] = ""
+        if is_stream:
+            self.video_hashes[vid_name] = "N/A (live camera stream)"
+        else:
+            try:
+                self.video_hashes[vid_name] = sha256_file(video_path)
+            except OSError as exc:
+                log.warning("Could not hash video %s: %s", video_path, exc)
+                self.video_hashes[vid_name] = ""
 
         # Fresh tracker per video so IDs never carry over between files.
         self._reset_tracker()
@@ -1985,8 +2153,9 @@ class KrishnaIntelligence(ctk.CTk):
                     self.gui_queue.put(("progress",
                                         frame_idx / total_frames
                                         if total_frames > 0 else 0))
-                    self.gui_queue.put(("performance",
-                                        f"⚡ Speed: {speed:.1f} FPS"))
+                    perf_text = (f"🔴 LIVE | ⚡ {speed:.1f} FPS" if is_stream
+                                else f"⚡ Speed: {speed:.1f} FPS")
+                    self.gui_queue.put(("performance", perf_text))
                 frame_idx += 1
         finally:
             cap.release()
@@ -2420,6 +2589,11 @@ class KrishnaIntelligence(ctk.CTk):
         qdir = os.path.join(
             self.base_dir, ".upload_queue",
             f"{self.current_case_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}")
+        # Pre-generate the report's view token client-side so the PDF's QR
+        # code (built next) can point at the exact final URL.
+        client_token = secrets.token_hex(24)
+        view_url = (f"{self.auth.server_url}/view.php?t={client_token}"
+                   if self.auth.server_url else "")
         try:
             os.makedirs(qdir, exist_ok=True)
             report = {
@@ -2447,14 +2621,16 @@ class KrishnaIntelligence(ctk.CTk):
                       encoding="utf-8") as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
 
-            pdf_ok, pdf_err = self._build_pdf(os.path.join(qdir, "report.pdf"))
+            pdf_ok, pdf_err = self._build_pdf(os.path.join(qdir, "report.pdf"),
+                                              qr_url=view_url)
             if not pdf_ok:
                 log.warning("PDF build failed: %s", pdf_err)
 
             meta = {"case_id": self.current_case_id,
                     "persons": self.stats.get("persons", 0),
                     "vehicles": self.stats.get("vehicles", 0),
-                    "total": len(self.evidence_database)}
+                    "total": len(self.evidence_database),
+                    "client_token": client_token}
             with open(os.path.join(qdir, "meta.json"), "w",
                       encoding="utf-8") as f:
                 json.dump(meta, f)
@@ -2493,7 +2669,8 @@ class KrishnaIntelligence(ctk.CTk):
                 ok, result = self.auth.upload_report(
                     meta.get("case_id", "CASE"),
                     os.path.join(qdir, "report.pdf"),
-                    os.path.join(qdir, "report.json"), meta)
+                    os.path.join(qdir, "report.json"), meta,
+                    client_token=meta.get("client_token", ""))
                 if ok:
                     shutil.rmtree(qdir, ignore_errors=True)
                 self.gui_queue.put(("upload_result", ok, result,
@@ -2513,8 +2690,12 @@ class KrishnaIntelligence(ctk.CTk):
         return hashlib.sha256(raw.encode()).hexdigest()[:10].upper()
 
     # ---------------------------------------------------------- PDF build --
-    def _build_pdf(self, path):
-        """Write the case PDF report to `path`. Returns (ok, error)."""
+    def _build_pdf(self, path, qr_url=""):
+        """Write the case PDF report to `path`. Returns (ok, error).
+
+        `qr_url`, if given, embeds a QR code linking to the report's own
+        online view URL — pre-generated client-side so the code in the
+        PDF matches the address the report ends up living at."""
         if not self.evidence_database:
             return False, "No evidence."
         try:
@@ -2542,6 +2723,17 @@ class KrishnaIntelligence(ctk.CTk):
                 gujarati_font = "NotoGujarati"
         except Exception as exc:
             log.warning("Gujarati font registration failed: %s", exc)
+
+        qr_flowable = None
+        if qr_url and HAS_QRCODE:
+            try:
+                qr_img = qrcode.make(qr_url)
+                qr_buf = io.BytesIO()
+                qr_img.save(qr_buf, format="PNG")
+                qr_buf.seek(0)
+                qr_flowable = RLImage(qr_buf, width=2.8 * cm, height=2.8 * cm)
+            except Exception as exc:
+                log.warning("QR code generation failed: %s", exc)
 
         try:
             profile = self.auth.profile or {}
@@ -2666,6 +2858,11 @@ class KrishnaIntelligence(ctk.CTk):
                 f"<b>Digitally verified by:</b> {operator} &nbsp;&nbsp; "
                 f"<b>Verification Code:</b> {self._report_verification_code()}",
                 small))
+            if qr_flowable is not None:
+                story.append(Spacer(1, 8))
+                story.append(qr_flowable)
+                story.append(Paragraph(
+                    "📱 Scan to open/verify this report online", small))
 
             doc.build(story)
             return True, ""
@@ -2935,6 +3132,55 @@ class KrishnaIntelligence(ctk.CTk):
             messagebox.showinfo("Clip Saved", f"Clip saved:\n{save_path}")
         except Exception as exc:
             messagebox.showerror("Clip Failed", f"Could not create clip:\n{exc}")
+
+    def show_help(self):
+        win = ctk.CTkToplevel(self)
+        win.title("❓ Help / About")
+        win.geometry("560x600")
+        win.configure(fg_color=BG_DARK)
+
+        ctk.CTkLabel(win, text=f"🦚 {APP_NAME}", font=("Arial Black", 20),
+                     text_color=HIGHLIGHT).pack(pady=(15, 0))
+        ctk.CTkLabel(win, text=APP_VERSION, font=("Courier", 10),
+                     text_color="gray").pack(pady=(0, 10))
+
+        box = ctk.CTkTextbox(win, font=("Arial", 11), fg_color=PANEL_BG)
+        box.pack(expand=True, fill="both", padx=15, pady=(0, 10))
+        box.insert("1.0", (
+            "QUICK WORKFLOW\n"
+            "1. Load Batch Videos (or Add Live Camera) → choose filters →\n"
+            "   press START.\n"
+            "2. Evidence photos appear live in the gallery on the right;\n"
+            "   click a photo to zoom, use ⭐/📝/🗑/🎬 on each card.\n"
+            "3. When the scan ends, the report uploads to the web panel\n"
+            "   automatically and a WhatsApp message with the report link\n"
+            "   is sent to you. No report is ever left on this PC.\n\n"
+            "SIDEBAR TOOLS\n"
+            "- SYNC PENDING REPORTS: retry any report that failed to\n"
+            "  upload earlier (no internet at the time).\n"
+            "- Advanced AI & Security: face recognition, plate OCR, face\n"
+            "  blur, watermark, encryption, loiter/crowd thresholds, AI\n"
+            "  model size, GPU choice, auto-lock — switches that need an\n"
+            "  extra package show as disabled with a hint underneath.\n\n"
+            "EVIDENCE PANEL TOOLS\n"
+            "➕ Manual: add a photo evidence not captured by AI.\n"
+            "📦 ZIP: export all photos of the current case.\n"
+            "📊 Stats: quick chart for the current case.\n"
+            "📁 Recent: reopen a past case's photos for review.\n"
+            "🆚 Compare: heuristic match between two saved cases.\n"
+            "🖨 Print: prints the current report directly (not saved).\n\n"
+            "FOR MORE DETAIL\n"
+            "Open the web panel's own Help page for the full guide,\n"
+            "including how registration, validity and reports work."))
+        box.configure(state="disabled")
+
+        server = self.auth.server_url
+        if server:
+            ctk.CTkButton(
+                win, text="🌐 Open Full Guide on the Website", height=38,
+                fg_color=ACCENT, hover_color="#0891B2",
+                command=lambda: webbrowser.open(f"{server}/help.php")
+            ).pack(padx=15, pady=(0, 15), fill="x")
 
     def show_analytics(self):
         win = ctk.CTkToplevel(self)

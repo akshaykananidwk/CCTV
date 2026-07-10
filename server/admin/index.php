@@ -32,6 +32,50 @@ if (($_POST['do'] ?? '') === 'admin_login') {
 
 $logged = !empty($_SESSION['admin']);
 
+// ------------------------------------------------------- file downloads ----
+// Handled before any HTML output since they send their own headers.
+if ($logged && isset($_GET['export']) && $_GET['export'] === 'reports_csv') {
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="krishna_reports.csv"');
+    $out = fopen('php://output', 'w');
+    fputcsv($out, ['Date', 'Case ID', 'Operator', 'Police Station',
+        'Persons', 'Vehicles', 'Total', 'View Link']);
+    foreach ($pdo->query(
+        "SELECT r.*, u.username, u.police_station FROM reports r
+         JOIN users u ON u.id = r.user_id ORDER BY r.id DESC") as $r) {
+        fputcsv($out, [$r['created_at'], $r['case_id'], $r['username'],
+            $r['police_station'], $r['persons'], $r['vehicles'], $r['total'],
+            cfg()['base_url'] . '/view.php?t=' . $r['view_token']]);
+    }
+    fclose($out);
+    audit_log('export_csv', 'reports', 'Admin exported reports CSV');
+    exit;
+}
+
+if ($logged && isset($_GET['export']) && $_GET['export'] === 'reports_zip') {
+    $zipPath = tempnam(sys_get_temp_dir(), 'krishna_zip_');
+    $zip = new ZipArchive();
+    $zip->open($zipPath, ZipArchive::OVERWRITE);
+    $reportsDir = __DIR__ . '/../data/reports';
+    foreach ($pdo->query(
+        "SELECT case_id, pdf_file FROM reports
+         WHERE pdf_file IS NOT NULL ORDER BY id DESC LIMIT 500") as $r) {
+        $full = "$reportsDir/{$r['pdf_file']}";
+        if (is_file($full)) {
+            $safeCase = preg_replace('/[^A-Za-z0-9_-]/', '_', $r['case_id']);
+            $zip->addFile($full, "{$safeCase}_{$r['pdf_file']}");
+        }
+    }
+    $zip->close();
+    audit_log('export_zip', 'reports', 'Admin downloaded all report PDFs as ZIP');
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="krishna_all_reports.zip"');
+    header('Content-Length: ' . filesize($zipPath));
+    readfile($zipPath);
+    unlink($zipPath);
+    exit;
+}
+
 // ---------------------------------------------------------------- actions --
 if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $do = $_POST['do'] ?? '';
@@ -76,6 +120,8 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     . "'Forgot Password' in the software to set your own.");
                 $msg = "User '$username' created and WhatsApp sent "
                      . "(password NOT included in the message).";
+                audit_log('add_user', $username, "station=$station validity=" .
+                    ($validUntil ?: 'unlimited'));
             } catch (PDOException $e) {
                 $err = 'Username already exists.';
             }
@@ -100,6 +146,8 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $msg = "Validity for '{$row['username']}' set to "
                  . ($validUntil ? date('d-m-Y', strtotime($validUntil))
                                 : 'unlimited') . ".";
+            audit_log('set_validity', $row['username'],
+                $validUntil ? "till $validUntil" : 'unlimited');
         }
     }
 
@@ -121,6 +169,7 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
         $msg = 'User status updated.';
+        audit_log('set_status', (string)$_POST['uid'], $_POST['status']);
     }
 
     if ($do === 'reset_pass' && isset($_POST['uid'])) {
@@ -140,6 +189,29 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 . "admin, or use 'Forgot Password' in the software.");
             $msg = "Password for '{$row['username']}' reset to: $new "
                  . "(share it personally — NOT sent on WhatsApp).";
+            audit_log('reset_pass', $row['username'], 'Password reset by admin');
+        }
+    }
+
+    if ($do === 'share_report' && isset($_POST['rid'])) {
+        $target = trim($_POST['share_username'] ?? '');
+        $u = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+        $u->execute([$target]);
+        $targetUser = $u->fetch(PDO::FETCH_ASSOC);
+        if (!$targetUser) {
+            $err = "User '$target' not found.";
+        } else {
+            try {
+                $pdo->prepare(
+                    "INSERT INTO report_shares (report_id, user_id, added_at)
+                     VALUES (?, ?, ?)")
+                    ->execute([(int)$_POST['rid'], $targetUser['id'], now()]);
+                $msg = "Report shared with '$target' — it will appear in "
+                     . "their My Reports page.";
+                audit_log('share_report', (string)$_POST['rid'], "with=$target");
+            } catch (PDOException $e) {
+                $err = "Already shared with '$target'.";
+            }
         }
     }
 
@@ -158,6 +230,7 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $ok = wa_send($row['mobile'], $m, $row['pdf_file'] ? $viewUrl : '');
             $msg = $ok ? "WhatsApp sent again to {$row['mobile']}."
                        : 'WhatsApp send failed — check API config.';
+            audit_log('resend_report', (string)$_POST['rid'], "case={$row['case_id']}");
         }
     }
 
@@ -171,7 +244,10 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
             $pdo->prepare("DELETE FROM reports WHERE id = ?")->execute([$row['id']]);
+            $pdo->prepare("DELETE FROM report_shares WHERE report_id = ?")
+                ->execute([$row['id']]);
             $msg = 'Report deleted.';
+            audit_log('del_report', (string)$row['id'], "case={$row['case_id']}");
         }
     }
 }
@@ -237,6 +313,9 @@ button.gray{background:#374151}
     <a href="?page=users">👥 Users</a>
     <a href="?page=logins">🖥 Login History</a>
     <a href="?page=reports">📄 Reports</a>
+    <a href="?page=stats">📊 Statistics</a>
+    <a href="?page=audit">🧾 Audit Log</a>
+    <a href="../help.php" target="_blank">❓ Help</a>
     <a href="?logout=1" style="color:#EF4444">Logout</a>
   </div>
 </div>
@@ -351,16 +430,53 @@ $totL = $pdo->query("SELECT COUNT(*) FROM login_logs")->fetchColumn();
     </table>
   </div>
 
-<?php elseif ($page === 'reports'): ?>
+<?php elseif ($page === 'reports'):
+  $q = trim($_GET['q'] ?? '');
+  $from = trim($_GET['from'] ?? '');
+  $to = trim($_GET['to'] ?? '');
+  $sql = "SELECT r.*, u.username, u.police_station FROM reports r
+          JOIN users u ON u.id = r.user_id WHERE 1=1";
+  $params = [];
+  if ($q !== '') {
+      $sql .= " AND (r.case_id LIKE ? OR u.username LIKE ? OR u.police_station LIKE ?)";
+      $like = "%$q%";
+      $params = array_merge($params, [$like, $like, $like]);
+  }
+  if ($from !== '') {
+      $sql .= " AND date(r.created_at) >= ?";
+      $params[] = $from;
+  }
+  if ($to !== '') {
+      $sql .= " AND date(r.created_at) <= ?";
+      $params[] = $to;
+  }
+  $sql .= " ORDER BY r.id DESC LIMIT 300";
+  $stmt = $pdo->prepare($sql);
+  $stmt->execute($params);
+  ?>
+  <div class="card">
+    <h2>🔍 Search / Filter Reports</h2>
+    <form method="get">
+      <input type="hidden" name="page" value="reports">
+      <input name="q" placeholder="Case ID / Username / Station"
+             value="<?= htmlspecialchars($q) ?>">
+      <input name="from" type="date" value="<?= htmlspecialchars($from) ?>" title="From date">
+      <input name="to" type="date" value="<?= htmlspecialchars($to) ?>" title="To date">
+      <button>Search</button>
+      <a href="?page=reports" class="gray" style="margin-left:6px">Clear</a>
+      &nbsp;|&nbsp;
+      <a href="?export=reports_csv">📊 Export CSV</a>
+      &nbsp;
+      <a href="?export=reports_zip">📦 Download All PDFs (ZIP)</a>
+    </form>
+  </div>
   <div class="card">
     <h2>📄 Uploaded Case Reports</h2>
     <table>
       <tr><th>Time</th><th>Case ID</th><th>Operator</th><th>Police Station</th>
           <th>👤</th><th>🚗</th><th>📸</th><th>View</th>
-          <th>Report Link</th><th>Actions</th></tr>
-      <?php foreach ($pdo->query(
-          "SELECT r.*, u.username, u.police_station FROM reports r
-           JOIN users u ON u.id = r.user_id ORDER BY r.id DESC LIMIT 300") as $r):
+          <th>Report Link</th><th>Share</th><th>Actions</th></tr>
+      <?php foreach ($stmt as $r):
           $link = cfg()['base_url'] . '/view.php?t=' . $r['view_token']; ?>
       <tr>
         <td><?= $r['created_at'] ?></td>
@@ -380,10 +496,18 @@ $totL = $pdo->query("SELECT COUNT(*) FROM login_logs")->fetchColumn();
         </td>
         <td>
           <input readonly value="<?= htmlspecialchars($link) ?>"
-                 style="width:190px;font-size:11px"
+                 style="width:170px;font-size:11px"
                  onclick="this.select();document.execCommand('copy');
                           this.style.borderColor='#10B981';"
                  title="Click to copy link">
+        </td>
+        <td>
+          <form method="post" style="display:flex;gap:4px">
+            <input type="hidden" name="do" value="share_report">
+            <input type="hidden" name="rid" value="<?= $r['id'] ?>">
+            <input name="share_username" placeholder="username" style="width:80px">
+            <button class="gray" title="Also show this report in that user's My Reports">Share</button>
+          </form>
         </td>
         <td style="white-space:nowrap">
           <form method="post" style="display:inline">
@@ -398,6 +522,60 @@ $totL = $pdo->query("SELECT COUNT(*) FROM login_logs")->fetchColumn();
             <button class="warn">Delete</button>
           </form>
         </td>
+      </tr>
+      <?php endforeach; ?>
+    </table>
+  </div>
+
+<?php elseif ($page === 'stats'): ?>
+  <div class="card">
+    <h2>🏢 Station-wise Reports</h2>
+    <table>
+      <tr><th>Police Station</th><th>Reports</th><th>👤 Persons</th><th>🚗 Vehicles</th></tr>
+      <?php foreach ($pdo->query(
+          "SELECT u.police_station, COUNT(*) AS cnt, SUM(r.persons) AS p,
+                  SUM(r.vehicles) AS v
+           FROM reports r JOIN users u ON u.id = r.user_id
+           GROUP BY u.police_station ORDER BY cnt DESC") as $s): ?>
+      <tr>
+        <td><?= htmlspecialchars($s['police_station']) ?></td>
+        <td><?= $s['cnt'] ?></td>
+        <td><?= (int)$s['p'] ?></td>
+        <td><?= (int)$s['v'] ?></td>
+      </tr>
+      <?php endforeach; ?>
+    </table>
+  </div>
+  <div class="card">
+    <h2>📅 Monthly Reports</h2>
+    <table>
+      <tr><th>Month</th><th>Reports</th><th>👤 Persons</th><th>🚗 Vehicles</th></tr>
+      <?php foreach ($pdo->query(
+          "SELECT strftime('%Y-%m', created_at) AS ym, COUNT(*) AS cnt,
+                  SUM(persons) AS p, SUM(vehicles) AS v
+           FROM reports GROUP BY ym ORDER BY ym DESC LIMIT 24") as $s): ?>
+      <tr>
+        <td><?= $s['ym'] ?></td>
+        <td><?= $s['cnt'] ?></td>
+        <td><?= (int)$s['p'] ?></td>
+        <td><?= (int)$s['v'] ?></td>
+      </tr>
+      <?php endforeach; ?>
+    </table>
+  </div>
+
+<?php elseif ($page === 'audit'): ?>
+  <div class="card">
+    <h2>🧾 Admin Audit Log</h2>
+    <table>
+      <tr><th>Time</th><th>Action</th><th>Target</th><th>Detail</th></tr>
+      <?php foreach ($pdo->query(
+          "SELECT * FROM admin_audit_log ORDER BY id DESC LIMIT 300") as $a): ?>
+      <tr>
+        <td><?= $a['created_at'] ?></td>
+        <td><?= htmlspecialchars($a['action']) ?></td>
+        <td><?= htmlspecialchars($a['target']) ?></td>
+        <td><?= htmlspecialchars($a['detail']) ?></td>
       </tr>
       <?php endforeach; ?>
     </table>

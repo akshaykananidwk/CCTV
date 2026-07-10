@@ -1,6 +1,6 @@
 # 🦚 Krishna Intelligence
 
-**Forensic CCTV Video Analysis Suite** — `v16.0 Pro Enterprise`
+**Forensic CCTV Video Analysis Suite** — `v17.0 Pro Enterprise`
 
 AI-powered desktop software + web panel. The software scans CCTV footage in
 batches, detects and tracks persons / vehicles / animals with YOLOv8, captures
@@ -59,21 +59,33 @@ link on WhatsApp.
   signature) + operator/designation stamp on every report; **SHA-256 hash**
   of every source video stored in the report for evidentiary integrity
 
-**Not implemented / intentionally deferred** (so nothing is oversold):
-weapon detection (no reliable free model exists), age/gender estimation
-(needs pretrained model files not bundled), true multi-camera face re-ID
-across separate cameras (only the same-case heuristic above exists), live
-RTSP camera feed, multi-video split-screen scanning, true parallel
-multi-video GPU processing (a single shared YOLO tracker isn't safe for
-that), Excel export of the report (would create a local report copy,
-against the "internet-only reports" rule), a QR code linking straight to
-the live report URL (needs a small server change), and full Gujarati PDF
-text (works only if you supply `fonts/NotoSansGujarati-Regular.ttf`
-yourself — the code path is ready, the font file is not bundled). Full
-light-theme colors and app-wide font scaling are partially wired (setting
-+ toggle exist) but not yet applied to every existing widget.
+### 🆕 v17 additions
+- 📡 **Live camera (RTSP/HTTP)** — "Add Live Camera" next to Load Batch
+  Videos, scanned like a video with no natural end (⏹ ABORT to stop);
+  code-complete but not verified against real camera hardware
+- 👁 **Quick preview at 2x/4x** — skim a video before running the full AI
+  scan (no detection, just fast playback)
+- 🌗 **Full Dark/Light theme** — the whole palette switches, not just a
+  couple of colors (restart to apply)
+- 🔳 **QR code on the PDF** — links straight to the report's own online
+  view URL (the client pre-generates the token so the QR matches exactly)
+- ❓ **Help / About** in the software, linking to the website's full guide
+
+**Still not implemented / intentionally deferred:** weapon detection (no
+reliable free model exists), age/gender estimation (needs pretrained model
+files not bundled), true multi-camera face re-ID across separate cameras
+(only the same-case heuristic exists), multi-video split-screen scanning,
+true parallel multi-video GPU processing (a single shared YOLO tracker
+isn't safe for that), Excel export *of the report* on the PC (would create
+a local report copy, against the "internet-only reports" rule — but the
+**website now has server-side CSV export**, which doesn't have that
+problem), and full Gujarati PDF text (works only if you supply
+`fonts/NotoSansGujarati-Regular.ttf` yourself — the code path is ready,
+the font file is not bundled).
 
 ### 🌐 Web Panel (`server/` — PHP + SQLite)
+- 🏠 **Home page** (`index.php`) — navigation to Register / My Reports /
+  Help / Admin
 - 👥 **Admin panel** (`admin/`) — create users (name, office/police station,
   **designation (હોદ્દો)**, username, password, WhatsApp mobile); account
   details **auto-sent on WhatsApp — password is NEVER sent**. Approve /
@@ -81,8 +93,19 @@ light-theme colors and app-wide font scaling are partially wired (setting
 - ⏳ **Validity control** — admin sets how many days each user can use the
   software (or unlimited); expired accounts cannot login or upload until the
   admin extends them; validity changes notified on WhatsApp.
-- 📄 **Reports page** — every report with **copyable report link** and a
-  **📲 Send Again** button that re-sends the WhatsApp message with the link.
+- 📄 **Reports page** — **search/filter** (case ID, username, station, date
+  range), copyable report link, **📲 Send Again** WhatsApp resend, **📊
+  Export CSV**, **📦 download all report PDFs as one ZIP**, and **🤝 Share**
+  a report with a second operator so it shows in their My Reports too.
+- 📄 **My Reports** (`myreports.php`) — operators log in with their
+  **software username/password** and see only their own (+ shared) reports.
+- 📊 **Statistics page** — station-wise and monthly report/persons/vehicles
+  totals.
+- 🧾 **Audit log** — every admin action (user created, approved, disabled,
+  password reset, validity changed, report shared/resent/deleted) with a
+  timestamp.
+- ❓ **Help page** (`help.php`) — full "how to use" guide for both the
+  software and the website, in Gujarati, linked from every page.
 - 🖥 **Login history** — PC name, operating system, PC user and IP of every
   software login.
 - 📝 **Self-registration** (`register.php`, opens from the software's login
@@ -106,8 +129,13 @@ Any normal PHP hosting (cPanel etc.), PHP 8.0+ with SQLite.
    - `wa_session_id` / `wa_api_key` → **your bulk.akdwk.in API values**
      (⚠ keep them secret — never post publicly or commit to GitHub)
 3. `server/data/` folder writable (755/775).
-4. Open `https://yourdomain.in/krishna/admin/` → login → create users.
-5. Self-registration: `https://yourdomain.in/krishna/register.php`.
+4. Open `https://yourdomain.in/krishna/` — the home page links to
+   Register, My Reports, Help and the Admin Panel.
+5. Admin Panel: `https://yourdomain.in/krishna/admin/` → login → create users.
+6. Self-registration: `https://yourdomain.in/krishna/register.php`.
+7. Operators' own reports: `https://yourdomain.in/krishna/myreports.php`
+   (same username/password as the software).
+8. Full guide for everyone: `https://yourdomain.in/krishna/help.php`.
 
 ## 🖥 Software Installation (Windows) — સ્થાપના
 
@@ -126,13 +154,17 @@ copy કરીને exe ચલાવો (Python વગર).
 
 ## 🚀 Workflow — આખો ફ્લો
 
-1. Admin panel માં user બનાવો → WhatsApp પર username/password જાય.
+1. Admin panel માં user બનાવો → WhatsApp પર username/password જાય. (અથવા
+   operator જાતે [Register](server/register.php) કરે → admin approve કરે.)
 2. Software ખોલો → login (7 દિવસ યાદ; દરેક login PC name/OS/IP સાથે
    admin panel માં દેખાય). Password ભૂલી ગયા? → **Forgot Password** → WhatsApp OTP.
-3. Videos load → START → evidence capture.
-4. Scan પૂરો (કે abort) → **report આપોઆપ website પર upload** → WhatsApp પર link.
+3. Videos load (કે Live Camera ઉમેરો) → START → evidence capture.
+4. Scan પૂરો (કે abort) → **report આપોઆપ website પર upload** (QR code સાથે) → WhatsApp પર link.
 5. Internet ન હોય → report ક્યાંય નહીં મળે; internet આવે એટલે આપોઆપ upload.
-6. Admin panel → Reports → link copy કરો કે **Send Again** થી WhatsApp ફરી મોકલો.
+6. Admin panel → Reports → link copy કરો, **Send Again**, **Share** (બીજા officer સાથે),
+   કે CSV/ZIP export કરો. Operator પોતે [My Reports](server/myreports.php) માં login
+   કરીને પોતાના reports જોઈ શકે.
+7. બધું કેવી રીતે વાપરવું એની આખી guide [Help page](server/help.php) પર.
 
 ### PC પર શું સેવ થાય (ફક્ત evidence photos — report નહીં)
 ```
