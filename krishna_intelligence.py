@@ -275,8 +275,34 @@ class AuthClient:
     def _post(self, action, data=None, files=None, timeout=20):
         url = f"{self.server_url}/api.php?action={action}"
         resp = requests.post(url, data=data or {}, files=files, timeout=timeout)
+        if resp.status_code >= 400:
+            # Log the real body (often a PHP error page on bad hosting
+            # config) so it ends up in krishna_intelligence.log instead of
+            # a generic "server not reachable" that hides the real cause.
+            log.error("%s -> HTTP %d: %s", action, resp.status_code,
+                     resp.text[:500])
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError:
+            log.error("%s -> non-JSON response (HTTP %d): %s", action,
+                     resp.status_code, resp.text[:500])
+            raise
+
+    def ping(self):
+        """No-auth reachability + configuration check. Returns a dict:
+        {'ok': bool, 'error': str, ...diagnostic fields from the server}."""
+        if not self.server_url:
+            return {"ok": False, "error": "Server URL is not set."}
+        try:
+            return self._post("ping", timeout=10)
+        except requests.RequestException as exc:
+            return {"ok": False, "error": f"Cannot reach the server: {exc}"}
+        except ValueError:
+            return {"ok": False,
+                    "error": "Server responded but not with valid JSON "
+                             "(check the Server URL is correct, and that "
+                             "server/ was uploaded to that exact path)."}
 
     def login(self, username, password):
         """Returns (ok, message)."""
@@ -345,9 +371,10 @@ class AuthClient:
         return False, out.get("error", "Reset failed.")
 
     def upload_report(self, case_id, pdf_path, json_path, stats):
-        """Upload the case report (PDF + JSON only). Returns (ok, link_or_error)."""
+        """Upload the case report (PDF + JSON only).
+        Returns (ok, link_or_error, whatsapp_sent)."""
         if not self.token:
-            return False, "Not logged in."
+            return False, "Not logged in.", False
         try:
             files = {}
             handles = []
@@ -358,7 +385,7 @@ class AuthClient:
                     handles.append(fh)
                     files[field] = (os.path.basename(path), fh)
             if not files:
-                return False, "No report files to upload."
+                return False, "No report files to upload.", False
             try:
                 out = self._post("upload_report", {
                     "token": self.token,
@@ -372,12 +399,58 @@ class AuthClient:
                     fh.close()
         except requests.RequestException as exc:
             log.error("Report upload failed: %s", exc)
-            return False, "Upload failed — server not reachable."
+            return False, f"Upload failed — server not reachable: {exc}", False
         except ValueError:
-            return False, "Invalid response from server."
+            return False, "Invalid response from server.", False
         if out.get("ok"):
-            return True, out.get("view_url", "")
-        return False, out.get("error", "Upload rejected by server.")
+            return True, out.get("view_url", ""), bool(out.get("whatsapp_sent", True))
+        return False, out.get("error", "Upload rejected by server."), False
+
+    def diagnose(self):
+        """Step-by-step self-test used by the 'Test Server & Upload' button
+        so the operator can see EXACTLY where the report pipeline breaks,
+        instead of a single generic 'upload failed'. Returns a list of
+        (label, ok, detail) tuples."""
+        steps = []
+
+        if not self.server_url:
+            steps.append(("Server URL", False, "Not set."))
+            return steps
+        steps.append(("Server URL", True, self.server_url))
+
+        info = self.ping()
+        if not info.get("ok"):
+            steps.append(("Reach server (ping)", False,
+                         info.get("error", "Unknown error.")))
+            return steps
+        steps.append(("Reach server (ping)", True, "Server responded."))
+        steps.append(("Server database", bool(info.get("db_ok")),
+                     "OK" if info.get("db_ok") else
+                     "Database error on server — check server/data/ "
+                     "permissions and krishna.db."))
+        steps.append(("PHP curl extension (needed for WhatsApp)",
+                     bool(info.get("curl_available")),
+                     "OK" if info.get("curl_available") else
+                     "Missing — ask your host to enable ext-curl."))
+        steps.append(("WhatsApp API configured", bool(info.get("whatsapp_configured")),
+                     "OK" if info.get("whatsapp_configured") else
+                     "server/config.php still has placeholder "
+                     "wa_session_id / wa_api_key."))
+        steps.append(("base_url configured", bool(info.get("base_url_set")),
+                     "OK" if info.get("base_url_set") else
+                     "server/config.php base_url is still the example "
+                     "placeholder — report links will be broken."))
+
+        if not self.token:
+            steps.append(("Login session", False,
+                         "Not logged in in this session."))
+            return steps
+        status = self.verify()
+        steps.append(("Login session valid", status == "ok",
+                     {"ok": "Valid.", "offline": "Server unreachable.",
+                      "invalid": "Expired or account disabled — login "
+                                "again."}.get(status, status)))
+        return steps
 
 
 # ====================================================== forgot password ====
@@ -1318,6 +1391,10 @@ class KrishnaIntelligence(ctk.CTk):
                       font=("Arial", 11, "bold"), fg_color=PURPLE,
                       hover_color="#7C3AED", height=40,
                       command=self.sync_reports).pack(pady=5, padx=10, fill="x")
+        ctk.CTkButton(self.sidebar, text="🔧 TEST SERVER & UPLOAD",
+                      font=("Arial", 11, "bold"), fg_color="#374151",
+                      hover_color="#4B5563", height=36,
+                      command=self.run_diagnostics).pack(pady=(0, 5), padx=10, fill="x")
         ctk.CTkButton(self.sidebar, text="📁 OPEN DATABASE",
                       font=("Arial", 11, "bold"), fg_color="#34495E",
                       hover_color=ACCENT, height=40,
@@ -2490,18 +2567,64 @@ class KrishnaIntelligence(ctk.CTk):
                 except (OSError, ValueError):
                     shutil.rmtree(qdir, ignore_errors=True)
                     continue
-                ok, result = self.auth.upload_report(
+                ok, result, wa_sent = self.auth.upload_report(
                     meta.get("case_id", "CASE"),
                     os.path.join(qdir, "report.pdf"),
                     os.path.join(qdir, "report.json"), meta)
                 if ok:
                     shutil.rmtree(qdir, ignore_errors=True)
                 self.gui_queue.put(("upload_result", ok, result,
-                                    meta.get("case_id", "")))
+                                    meta.get("case_id", ""), wa_sent))
                 if not ok:
                     break  # server unreachable — keep the rest queued
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def run_diagnostics(self):
+        """Step through the whole report pipeline (reachability, server
+        config, login session) and show exactly where it breaks — for
+        diagnosing 'report / WhatsApp not arriving' without needing to
+        read server logs."""
+        self.lbl_status.configure(text="🔧 Testing server connection...",
+                                  text_color=ACCENT)
+
+        def worker():
+            steps = self.auth.diagnose()
+            self.after(0, lambda: self._show_diagnostics(steps))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_diagnostics(self, steps):
+        self.lbl_status.configure(text="✅ System Ready" if self.model_status == "ready"
+                                  else "Please login...", text_color=SUCCESS)
+        win = ctk.CTkToplevel(self)
+        win.title("🔧 Server & Upload Diagnostics")
+        win.geometry("520x420")
+        win.configure(fg_color=BG_DARK)
+        ctk.CTkLabel(win, text="🔧 Server & Upload Diagnostics",
+                     font=("Arial Black", 15),
+                     text_color=HIGHLIGHT).pack(pady=(15, 10))
+        scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        scroll.pack(expand=True, fill="both", padx=15, pady=(0, 10))
+        for label, ok, detail in steps:
+            row = ctk.CTkFrame(scroll, fg_color=PANEL_BG, corner_radius=6)
+            row.pack(fill="x", pady=3)
+            icon = "✅" if ok else "❌"
+            color = SUCCESS if ok else DANGER
+            ctk.CTkLabel(row, text=f"{icon} {label}", font=("Arial", 12, "bold"),
+                        text_color=color, anchor="w").pack(fill="x", padx=10,
+                                                            pady=(8, 0))
+            ctk.CTkLabel(row, text=str(detail), font=("Courier", 10),
+                        text_color="gray", anchor="w", wraplength=450,
+                        justify="left").pack(fill="x", padx=10, pady=(0, 8))
+        all_ok = all(ok for _, ok, _ in steps)
+        ctk.CTkLabel(win,
+                    text="✅ Everything checks out." if all_ok else
+                    "⚠ Fix the ❌ item(s) above, starting from the top — "
+                    "later steps depend on earlier ones.",
+                    font=("Arial", 11, "bold"),
+                    text_color=SUCCESS if all_ok else WARNING,
+                    wraplength=470).pack(pady=(0, 15), padx=15)
 
     def _report_verification_code(self):
         """A lightweight authenticity marker (SHA-256 short code), not a
@@ -3063,28 +3186,32 @@ class KrishnaIntelligence(ctk.CTk):
 
                 elif kind == "upload_result":
                     ok, result, case_id = msg[1], msg[2], msg[3]
+                    wa_sent = msg[4] if len(msg) > 4 else True
                     if ok:
                         self.lbl_status.configure(text="☁ Report Uploaded ✅",
                                                   text_color=SUCCESS)
+                        wa_line = ("📲 WhatsApp message sent." if wa_sent else
+                                  "⚠ WhatsApp message FAILED to send — the "
+                                  "report is saved, use 📲 Send Again in "
+                                  "the admin panel, or check server "
+                                  "config.php's WhatsApp API keys.")
                         self.timeline_text.insert(
                             tk.END, f"☁ Report uploaded ({case_id}): "
-                                    f"{result}\n📲 WhatsApp message sent.\n")
+                                    f"{result}\n{wa_line}\n")
                         self.timeline_text.see(tk.END)
                         messagebox.showinfo(
                             "Uploaded",
                             f"Report uploaded to the web panel!\n"
-                            f"📋 Case: {case_id}\n"
-                            "📲 A WhatsApp message with the report link "
-                            "was sent to your registered number.")
+                            f"📋 Case: {case_id}\n" + wa_line)
                     else:
                         self.lbl_status.configure(
-                            text="☁ Upload Pending (no internet)",
-                            text_color=WARNING)
+                            text="☁ Upload Failed", text_color=DANGER)
                         self.timeline_text.insert(
                             tk.END,
-                            f"☁ Upload pending ({case_id}): {result}\n"
-                            "It will upload when internet returns — or "
-                            "press SYNC PENDING REPORTS.\n")
+                            f"☁ Upload FAILED ({case_id}): {result}\n"
+                            "The report stays saved on this PC and will "
+                            "retry — or press 🔧 TEST SERVER & UPLOAD to "
+                            "see exactly why.\n")
                         self.timeline_text.see(tk.END)
 
                 elif kind == "model_ready":

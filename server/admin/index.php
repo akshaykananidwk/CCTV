@@ -155,9 +155,9 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
                . "👤 Persons: {$row['persons']} | 🚗 Vehicles: {$row['vehicles']}"
                . " | 📸 Total: {$row['total']}\n"
                . "🔗 View report: $viewUrl";
-            $ok = wa_send($row['mobile'], $m, $row['pdf_file'] ? $viewUrl : '');
+            [$ok, $reason] = wa_send($row['mobile'], $m, $row['pdf_file'] ? $viewUrl : '');
             $msg = $ok ? "WhatsApp sent again to {$row['mobile']}."
-                       : 'WhatsApp send failed — check API config.';
+                       : "WhatsApp send failed: $reason";
         }
     }
 
@@ -241,6 +241,36 @@ button.gray{background:#374151}
   </div>
 </div>
 <div class="wrap">
+<?php
+$configWarnings = [];
+if (strpos($c['wa_session_id'], 'PASTE_') === 0 || strpos($c['wa_api_key'], 'PASTE_') === 0) {
+    $configWarnings[] = 'WhatsApp API not configured — edit server/config.php '
+        . '(wa_session_id / wa_api_key) or NO messages or report links will '
+        . 'ever be sent.';
+}
+if (strpos($c['base_url'], 'CHANGE-ME') !== false) {
+    $configWarnings[] = "base_url in server/config.php is still the example "
+        . "placeholder — report links in WhatsApp messages will be broken.";
+}
+if (!function_exists('curl_init')) {
+    $configWarnings[] = 'PHP curl extension is not enabled on this server — '
+        . 'WhatsApp messages cannot be sent. Ask your hosting provider to '
+        . 'enable ext-curl.';
+}
+if (!is_writable(__DIR__ . '/../data')) {
+    $configWarnings[] = 'server/data/ is not writable — reports cannot be '
+        . 'saved. Fix folder permissions (755 or 775).';
+}
+if ($configWarnings): ?>
+  <div class="card" style="border:2px solid #EF4444;background:#2A0E0E">
+    <h2 style="color:#EF4444">⚠ Configuration Problem(s) Found</h2>
+    <ul style="margin:0;padding-left:20px;font-size:13px">
+      <?php foreach ($configWarnings as $w): ?>
+        <li style="margin-bottom:6px"><?= htmlspecialchars($w) ?></li>
+      <?php endforeach; ?>
+    </ul>
+  </div>
+<?php endif; ?>
 <?php if ($err): ?><p class="err"><?= htmlspecialchars($err) ?></p><?php endif; ?>
 <?php if ($msg): ?><p class="msg"><?= htmlspecialchars($msg) ?></p><?php endif; ?>
 

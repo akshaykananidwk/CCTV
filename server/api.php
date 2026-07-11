@@ -1,9 +1,48 @@
 <?php
 /**
  * Krishna Intelligence — Desktop app API.
- * Actions: login | verify | upload_report | forgot_request | forgot_reset
+ * Actions: ping | login | verify | upload_report | forgot_request | forgot_reset
  */
 require_once __DIR__ . '/helpers.php';
+
+// Safety net: ANY uncaught error/exception anywhere below (a DB hiccup, a
+// missing PHP extension, a hosting quirk) must still produce valid JSON.
+// Without this, the client gets a raw PHP error page, fails to parse it,
+// and reports "cannot reach server" — hiding the real cause and leaving
+// the report stuck re-queuing forever even though nothing is actually
+// wrong with the network.
+set_exception_handler(function (\Throwable $e) {
+    error_log('Krishna api.php uncaught: ' . $e->getMessage());
+    if (!headers_sent()) {
+        http_response_code(500);
+    }
+    json_out(['ok' => false, 'error' => 'Server error: ' . $e->getMessage()]);
+});
+
+// ------------------------------------------------------------------ ping ---
+// A no-auth diagnostic the software's "Test Server Connection" button (and
+// anyone debugging a broken deployment) can call to see exactly what is
+// and is not configured, instead of guessing from a generic failure.
+if (($_GET['action'] ?? '') === 'ping') {
+    $c = cfg();
+    $dbOk = false;
+    try {
+        db()->query('SELECT 1');
+        $dbOk = true;
+    } catch (\Throwable $e) {
+        error_log('Krishna ping: DB check failed: ' . $e->getMessage());
+    }
+    $waConfigured = strpos($c['wa_session_id'], 'PASTE_') !== 0
+                  && strpos($c['wa_api_key'], 'PASTE_') !== 0;
+    json_out([
+        'ok' => true,
+        'server_time' => now(),
+        'db_ok' => $dbOk,
+        'curl_available' => function_exists('curl_init'),
+        'whatsapp_configured' => $waConfigured,
+        'base_url_set' => strpos($c['base_url'], 'CHANGE-ME') === false,
+    ]);
+}
 
 $action = $_GET['action'] ?? '';
 $pdo = db();
@@ -180,14 +219,21 @@ if ($action === 'upload_report') {
     $viewUrl = cfg()['base_url'] . '/view.php?t=' . $viewToken;
 
     // WhatsApp message with the report link (media attach when PDF exists).
+    // The report is already saved above — a WhatsApp failure (bad API
+    // config, curl missing, gateway down, ...) must NEVER stop the client
+    // from getting its 'ok:true' response, or it will just re-upload the
+    // same report forever.
     $msg = "🦚 Krishna Intelligence\n"
          . "📋 Case: $caseId\n"
          . "🏢 " . $sess['police_station'] . "\n"
          . "👤 Persons: $persons | 🚗 Vehicles: $vehicles | 📸 Total: $total\n"
          . "🔗 View report: $viewUrl";
-    wa_send($sess['mobile'], $msg, $pdfFile ? $viewUrl : '');
+    [$waOk, $waReason] = wa_send($sess['mobile'], $msg, $pdfFile ? $viewUrl : '');
+    if (!$waOk) {
+        error_log("Krishna: report $caseId saved OK but WhatsApp failed: $waReason");
+    }
 
-    json_out(['ok' => true, 'view_url' => $viewUrl]);
+    json_out(['ok' => true, 'view_url' => $viewUrl, 'whatsapp_sent' => $waOk]);
 }
 
 // ------------------------------------------------------- forgot_request ----

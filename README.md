@@ -168,11 +168,19 @@ Krishna_Forensic_Data/
 
 ## 🛠 Troubleshooting
 
+**રિપોર્ટ website પર નથી જતો / WhatsApp નથી આવતો?**
+Software ના sidebar માં **🔧 TEST SERVER & UPLOAD** button દબાવો — એ
+step-by-step બતાવશે બરાબર ક્યાં અટકે છે (server સુધી પહોંચાય છે કે નહીં,
+database, curl, WhatsApp keys, base_url, login session — દરેક ✅/❌ સાથે).
+❌ જ્યાં દેખાય ત્યાંથી ઠીક કરો — ઉપરથી નીચે ક્રમમાં (પહેલો ❌ જ સાચું કારણ છે,
+પછીના બધા એના પર આધારિત છે).
+
 | સમસ્યા | ઉકેલ |
 |---|---|
 | "Internet is required" | Internet ચાલુ કરો — server વગર software નહીં ખૂલે |
-| WhatsApp message નથી આવતો | `config.php` માં `wa_session_id`/`wa_api_key` ચેક કરો |
+| WhatsApp message નથી આવતો, પણ report website પર દેખાય છે | Admin panel ઉપર લાલ "Configuration Problem" banner જુઓ, અથવા `config.php` માં `wa_session_id`/`wa_api_key` ચેક કરો |
+| Report પણ website પર નથી દેખાતો | **🔧 TEST SERVER & UPLOAD** ચલાવો — Server URL ખોટો છે, hosting પર `server/` update નથી થયું, કે login session expired હોઈ શકે |
 | "Account awaiting admin approval" | Admin panel → Users → Approve |
 | Report ની link ખોવાઈ ગઈ | Admin panel → Reports → **Send Again** |
 | "AI Model Failed" | Internet સાથે ફરી ચલાવો (model download થશે) |
-| વધુ માહિતી | `krishna_intelligence.log` જુઓ |
+| વધુ માહિતી | `krishna_intelligence.log` જુઓ (server બાજુ error હોય તો hosting ના PHP error log માં પણ) |
