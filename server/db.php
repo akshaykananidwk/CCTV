@@ -81,5 +81,32 @@ function db(): PDO
         created_at TEXT NOT NULL
     )");
 
+    // Extra viewers an admin can add to a report, e.g. a second officer
+    // working the same case — they see it in their own "My Reports" page.
+    $pdo->exec("CREATE TABLE IF NOT EXISTS report_shares (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        added_at TEXT NOT NULL,
+        UNIQUE(report_id, user_id)
+    )");
+
+    // Audit trail of admin actions (approve/disable/reset/validity/share).
+    $pdo->exec("CREATE TABLE IF NOT EXISTS admin_audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL,
+        target TEXT NOT NULL,
+        detail TEXT,
+        created_at TEXT NOT NULL
+    )");
+
     return $pdo;
+}
+
+function audit_log(string $action, string $target, string $detail = ''): void
+{
+    db()->prepare(
+        "INSERT INTO admin_audit_log (action, target, detail, created_at)
+         VALUES (?, ?, ?, datetime('now'))"
+    )->execute([$action, $target, $detail]);
 }

@@ -12,6 +12,7 @@ ultralytics>=8.1.0
 lapx>=0.5.5
 reportlab>=4.0.0
 requests>=2.31.0
+qrcode[pil]>=7.4.0
 
 # ---- optional, for extra features (safe to skip; app degrades gracefully) ----
 # pytesseract>=0.3.10      # Number Plate OCR / CCTV overlay timestamp OCR

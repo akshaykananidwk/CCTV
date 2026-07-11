@@ -133,6 +133,10 @@ button{width:100%;padding:12px;margin-top:14px;border:0;border-radius:7px;
 <?php endif; ?>
 <?php if ($err): ?><p class="err"><?= htmlspecialchars($err) ?></p><?php endif; ?>
 <?php if ($msg): ?><p class="msg"><?= htmlspecialchars($msg) ?></p><?php endif; ?>
+<p style="text-align:center;font-size:12px;margin-top:14px;color:#94A3B8">
+  <a href="index.php" style="color:#06B6D4">🏠 Home</a> &nbsp;|&nbsp;
+  <a href="help.php" style="color:#06B6D4">❓ Help</a> &nbsp;|&nbsp;
+  <a href="myreports.php" style="color:#06B6D4">📄 My Reports</a></p>
 </div>
 </body>
 </html>
