@@ -1240,6 +1240,10 @@ class KrishnaIntelligence(ctk.CTk):
         ctk.CTkButton(live_row, text="👁 Preview 2x/4x", font=("Arial", 10),
                      height=32, fg_color="#374151",
                      command=self.preview_video
+                     ).pack(side="left", expand=True, fill="x", padx=2)
+        ctk.CTkButton(live_row, text="🗑 Clear Queue", font=("Arial", 10),
+                     height=32, fg_color="#7F1D1D", hover_color=DANGER,
+                     command=self.clear_video_queue
                      ).pack(side="left", expand=True, fill="x", padx=(2, 0))
 
         ctrl = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -1583,6 +1587,11 @@ class KrishnaIntelligence(ctk.CTk):
         self.color_filter.set(tmpl["color"])
 
     def toggle_theme(self):
+        if self.is_scanning:
+            messagebox.showwarning(
+                "Busy", "Stop the current scan before changing theme — "
+                        "restarting would abandon it mid-video.")
+            return
         new_theme = "light" if self.settings.get("theme", "dark") == "dark" else "dark"
         self.settings["theme"] = new_theme
         save_settings(self.settings)
@@ -1660,18 +1669,47 @@ class KrishnaIntelligence(ctk.CTk):
                       f"{len(faces)} face sample(s).")
 
     def import_videos(self):
+        if self.is_scanning:
+            messagebox.showwarning("Busy", "Stop the current scan first.")
+            return
         files = filedialog.askopenfilenames(
             title="Select Videos",
             filetypes=[("Video Files",
                        "*.mp4 *.avi *.mkv *.mov *.wmv *.dav *.h264 "
                        "*.ts *.mts *.m4v *.flv *.3gp *.asf")])
         if files:
-            self.video_list = list(files)
-            self.batch_label.configure(text=f"Queue: {len(files)} Videos Loaded")
+            # Adds to the queue rather than replacing it, so loading more
+            # files never silently discards a live camera (or files)
+            # already queued — use 🗑 Clear Queue for a fresh start.
+            self.video_list.extend(files)
+            self._refresh_queue_label()
+
+    def _refresh_queue_label(self):
+        n = len(self.video_list)
+        if n == 0:
+            self.batch_label.configure(text="Queue: 0 Videos")
             self.video_label.configure(
-                text=f"✅ {len(files)} FILES LOADED\nReady for Analysis",
-                text_color=SUCCESS)
-            self.lbl_status.configure(text="Ready to Scan", text_color=SUCCESS)
+                text="[ NO SIGNAL ]\nLoad videos to start", text_color="#555555")
+            return
+        n_live = sum(1 for v in self.video_list if self._is_stream_url(v))
+        suffix = f" (incl. {n_live} live)" if n_live else ""
+        self.batch_label.configure(text=f"Queue: {n} source(s){suffix}")
+        self.video_label.configure(
+            text=f"✅ {n} SOURCE(S) LOADED\nReady for Analysis",
+            text_color=SUCCESS)
+        self.lbl_status.configure(text="Ready to Scan", text_color=SUCCESS)
+
+    def clear_video_queue(self):
+        if self.is_scanning:
+            messagebox.showwarning("Busy", "Stop the current scan first.")
+            return
+        if not self.video_list:
+            return
+        if messagebox.askyesno("Clear Queue",
+                               f"Remove all {len(self.video_list)} queued "
+                               "source(s)?"):
+            self.video_list = []
+            self._refresh_queue_label()
 
     @staticmethod
     def _is_stream_url(source):
@@ -1679,6 +1717,9 @@ class KrishnaIntelligence(ctk.CTk):
             ("rtsp://", "rtsps://", "http://", "https://"))
 
     def add_live_camera(self):
+        if self.is_scanning:
+            messagebox.showwarning("Busy", "Stop the current scan first.")
+            return
         url = simpledialog.askstring(
             "Add Live Camera",
             "Enter the RTSP/HTTP camera URL\n"
@@ -1695,12 +1736,7 @@ class KrishnaIntelligence(ctk.CTk):
                                "http:// or https://")
             return
         self.video_list.append(url)
-        self.batch_label.configure(text=f"Queue: {len(self.video_list)} sources "
-                                        f"(incl. live camera)")
-        self.video_label.configure(
-            text=f"✅ {len(self.video_list)} SOURCE(S) LOADED\n"
-                 "Ready for Analysis", text_color=SUCCESS)
-        self.lbl_status.configure(text="Ready to Scan", text_color=SUCCESS)
+        self._refresh_queue_label()
         messagebox.showinfo(
             "Live Camera Added",
             "Live camera added to the queue.\n"
@@ -3163,7 +3199,7 @@ class KrishnaIntelligence(ctk.CTk):
         ctk.CTkLabel(win, text=info, font=("Courier", 11), justify="left",
                      text_color=ACCENT).pack(padx=10, pady=(0, 10))
 
-        if entry.get("source_path"):
+        if entry.get("source_path") and not self._is_stream_url(entry["source_path"]):
             ctk.CTkButton(win, text="🎬 Export ±5s Clip", height=32,
                          fg_color=PURPLE, hover_color="#7C3AED",
                          command=lambda e=entry: self._export_clip(e)
@@ -3387,7 +3423,8 @@ class KrishnaIntelligence(ctk.CTk):
                                  fg_color=PANEL_BG,
                                  command=lambda e=entry: self._edit_note(e)
                                  ).pack(side="left", padx=2)
-                    if entry.get("source_path"):
+                    if entry.get("source_path") and not self._is_stream_url(
+                            entry["source_path"]):
                         ctk.CTkButton(btn_row, text="🎬", width=28, height=24,
                                      fg_color=PANEL_BG,
                                      command=lambda e=entry: self._export_clip(e)
