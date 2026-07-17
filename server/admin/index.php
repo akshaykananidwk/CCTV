@@ -234,6 +234,22 @@ if ($logged && $_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    if ($do === 'test_whatsapp' && !empty($_POST['test_mobile'])) {
+        $testMobile = trim($_POST['test_mobile']);
+        [$waTestOk, $waTestReason] = wa_send($testMobile,
+            "🦚 Krishna Intelligence — this is a TEST message from the "
+            . "admin panel (" . now() . "). If you received this, WhatsApp "
+            . "sending is working correctly.");
+        $waTestResult = $waTestOk
+            ? "✅ Gateway accepted the message. Raw response: "
+              . htmlspecialchars(substr($waTestReason, 0, 400))
+              . " — now check the phone ($testMobile) actually received it "
+              . "within a minute; if not, the gateway itself is lying about "
+              . "delivery and bulk.akdwk.in needs checking directly."
+            : "❌ Send failed: " . htmlspecialchars($waTestReason);
+        audit_log('test_whatsapp', $testMobile, $waTestOk ? 'accepted' : 'failed');
+    }
+
     if ($do === 'del_report' && isset($_POST['rid'])) {
         $r = $pdo->prepare("SELECT * FROM reports WHERE id = ?");
         $r->execute([(int)$_POST['rid']]);
@@ -352,6 +368,26 @@ if ($configWarnings): ?>
 <?php endif; ?>
 <?php if ($err): ?><p class="err"><?= htmlspecialchars($err) ?></p><?php endif; ?>
 <?php if ($msg): ?><p class="msg"><?= htmlspecialchars($msg) ?></p><?php endif; ?>
+
+<div class="card">
+  <h2>📲 Send Test WhatsApp Message</h2>
+  <p style="font-size:12px;color:#94A3B8;margin-top:0">
+    "Configured" only means the API keys are filled in — it does NOT mean
+    WhatsApp is actually delivering. Send yourself a real test message and
+    check your phone; if the gateway says OK but nothing arrives, your
+    session on bulk.akdwk.in has likely disconnected and needs the QR code
+    scanned again.</p>
+  <form method="post" style="display:flex;gap:8px;flex-wrap:wrap">
+    <input type="hidden" name="do" value="test_whatsapp">
+    <input name="test_mobile" placeholder="10-digit mobile number" required
+           style="flex:1;min-width:180px">
+    <button>📤 Send Test</button>
+  </form>
+  <?php if (isset($waTestResult)): ?>
+    <p style="font-size:13px;margin-top:10px;padding:10px;background:#0A0E1A;
+              border-radius:6px;word-break:break-word"><?= $waTestResult ?></p>
+  <?php endif; ?>
+</div>
 
 <?php
 $totU = $pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();

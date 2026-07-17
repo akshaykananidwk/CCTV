@@ -110,6 +110,41 @@ function wa_send(string $mobile, string $message, string $mediaUrl = ''): array
         error_log("Krishna: $reason");
         return [false, $reason];
     }
+    // A 200 OK from these session-based WhatsApp gateways does NOT always
+    // mean the message was actually delivered — a disconnected session
+    // (needs the QR code re-scanned on bulk.akdwk.in), a wrong/expired
+    // session_id, or a malformed number commonly still return HTTP 200
+    // with an error described only in the response body. Without that
+    // check, a disconnected WhatsApp session looks identical to success
+    // and nothing ever tells the operator why messages stopped arriving.
+    $bodyLower = strtolower((string)$out);
+    $decoded = json_decode((string)$out, true);
+    $bodyLooksLikeFailure =
+        (is_array($decoded) && (
+            (array_key_exists('success', $decoded) && $decoded['success'] === false)
+            || (array_key_exists('status', $decoded)
+                && in_array(strtolower((string)$decoded['status']), ['error', 'fail', 'failed'], true))
+            || (array_key_exists('error', $decoded) && $decoded['error'])
+            || (array_key_exists('ok', $decoded) && $decoded['ok'] === false)
+        ))
+        || (!is_array($decoded) && (
+            str_contains($bodyLower, 'not connected')
+            || str_contains($bodyLower, 'disconnected')
+            || str_contains($bodyLower, 'session not found')
+            || str_contains($bodyLower, 'session expired')
+            || str_contains($bodyLower, 'invalid session')
+            || str_contains($bodyLower, 'unauthorized')
+            || str_contains($bodyLower, 'invalid api')
+        ));
+    if ($bodyLooksLikeFailure) {
+        $reason = 'WhatsApp gateway responded but reported failure — the '
+                . 'session on bulk.akdwk.in is likely disconnected (needs '
+                . 'the QR code re-scanned) or the session_id/api_key is '
+                . 'wrong. Raw response: ' . substr((string)$out, 0, 300);
+        error_log("Krishna: $reason");
+        return [false, $reason];
+    }
+    error_log('Krishna: WhatsApp gateway response: ' . substr((string)$out, 0, 300));
     return [true, (string)$out];
 }
 
