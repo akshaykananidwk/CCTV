@@ -964,6 +964,31 @@ class KrishnaIntelligence(ctk.CTk):
         # Login gate first; splash + model load start after login succeeds.
         self.login_window = LoginWindow(self, self.auth, self._on_logged_in)
 
+    def report_callback_exception(self, exc, val, tb):
+        """Tkinter calls this for ANY exception that escapes a button
+        command, .after() callback, or event binding uncaught. The default
+        behaviour is to print a traceback to stderr and otherwise continue
+        silently — invisible on a PC running the app via pythonw.exe with
+        no console window. A single bug here previously meant a whole
+        scan's report vanished with zero visible error. Always log it, and
+        tell the operator at least once so something this serious can
+        never disappear unnoticed again."""
+        log.error("Unhandled UI error: %s\n%s", val,
+                 "".join(traceback.format_exception(exc, val, tb)))
+        now_ts = time.time()
+        if now_ts - getattr(self, "_last_crash_popup", 0) > 5:
+            self._last_crash_popup = now_ts
+            try:
+                messagebox.showerror(
+                    "Unexpected Error",
+                    "Something went wrong internally:\n\n"
+                    f"{val}\n\n"
+                    "This has been written to krishna_intelligence.log — "
+                    "please share that file if the problem continues. "
+                    "The application will keep running.")
+            except Exception:
+                pass  # never let the error handler itself crash the app
+
     # ------------------------------------------------------- auto-lock -----
     def _register_activity(self, event=None):
         self._last_activity = time.time()
@@ -2296,7 +2321,15 @@ class KrishnaIntelligence(ctk.CTk):
                 if cls == 0:
                     person_count += 1
                 key = (vid_name, tid)
-                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                # Cast off numpy's float32 right here — leaving a numpy
+                # scalar in track_positions eventually lands in the report
+                # dict, and json.dump() cannot serialize numpy types (it
+                # raises TypeError, uncaught, deep inside a Tkinter after()
+                # callback — which is swallowed silently when the app runs
+                # via pythonw.exe with no console, so the report vanishes
+                # with zero visible error).
+                cx = float((box[0] + box[2]) / 2)
+                cy = float((box[1] + box[3]) / 2)
                 hist = self.track_positions.setdefault(key, [])
                 hist.append((frame_idx, cx, cy))
                 if len(hist) > 40:
@@ -2508,7 +2541,9 @@ class KrishnaIntelligence(ctk.CTk):
         f1, x1, y1 = hist[-1]
         dist_px = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
         seconds = (f1 - f0) / fps
-        return dist_px / seconds if seconds > 0 else 0.0
+        # float(...) guards against a numpy scalar ever reaching the report
+        # JSON again, even if a future change reintroduces one upstream.
+        return float(dist_px / seconds) if seconds > 0 else 0.0
 
     def _fernet(self):
         if not HAS_CRYPTO:
@@ -2748,8 +2783,27 @@ class KrishnaIntelligence(ctk.CTk):
                       encoding="utf-8") as f:
                 json.dump(meta, f)
             return qdir
-        except OSError as exc:
-            log.error("Could not queue report: %s", exc)
+        except Exception as exc:
+            # Broadened from `except OSError` on purpose: a report that
+            # fails to build for ANY reason (e.g. a stray numpy number
+            # that json.dump() cannot serialize) must never disappear
+            # silently — that previously meant the whole scan's report
+            # was lost with zero visible error, especially when running
+            # via pythonw.exe with no console to print a traceback to.
+            log.error("Could not queue report: %s\n%s", exc,
+                     traceback.format_exc())
+            self.gui_queue.put(
+                ("timeline",
+                 f"❌ REPORT BUILD FAILED — nothing was uploaded: {exc}\n"
+                 "See krishna_intelligence.log for details. Evidence "
+                 "photos are still safely saved on this PC.\n"))
+            messagebox.showerror(
+                "Report Failed",
+                f"The case report could not be built, so it was NOT "
+                f"uploaded and no WhatsApp message was sent.\n\n"
+                f"Reason: {exc}\n\n"
+                "Your evidence photos are safe on this PC. Please check "
+                "krishna_intelligence.log and report this error.")
             return None
 
     def sync_reports(self, silent=False):
